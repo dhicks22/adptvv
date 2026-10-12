@@ -1353,6 +1353,64 @@ def build_upcoming_context(df: pd.DataFrame, anchor_date: dt.date, n: int = 5) -
         return "No upcoming data."
 
 
+# What each insight button is allowed to talk about. Keeps the two cards on
+# the lens the coach picked instead of drifting into general wellness talk.
+PERSONA_LENS = {
+    "Acceleration & Speed Coach": (
+        "FOCUS ONLY ON: the sprint and acceleration work — distances, rep times, % of PB, rest between reps "
+        "and sets, how speed held across reps, acceleration vs top-speed work, and quality of each effort.\n"
+        "DO NOT COVER: gym loading, mobility, or general wellness trends (mention readiness in one short "
+        "clause only if it changes how the speed work should be read)."),
+    "Tempo & Endurance Coach": (
+        "FOCUS ONLY ON: tempo, conditioning and aerobic work — volumes, distances, effort vs load, RPE "
+        "relative to the session load, density and recovery between efforts.\n"
+        "DO NOT COVER: sprint technique, block starts or gym loading."),
+    "Technical Sprint Coach": (
+        "FOCUS ONLY ON: technique — 2 to 3 mechanical cues (posture, shin angle, first steps, arm action, "
+        "transition to upright running) tied to the drills and reps actually logged.\n"
+        "DO NOT COVER: training load, wellness scores, or gym loads."),
+    "Strength & Power Coach": (
+        "FOCUS ONLY ON: strength and power — gym lifts with their sets, reps and loads, % of PB or 1RM, "
+        "plyometrics, jumps, hops and bounding, and how that work supports sprinting. If no gym work was "
+        "logged, talk about the power or plyometric elements in the logged workout (e.g. hops, bounds, "
+        "throws) and what strength work should support it next.\n"
+        "DO NOT COVER: sleep or wellness trends, or sprint times as the main topic."),
+    "Recovery & Readiness Coach": (
+        "FOCUS ONLY ON: recovery and readiness — the sleep, energy, soreness and mood scores logged, how "
+        "they compare with recent days, session RPE vs load, and concrete actions for the next 12-24 hours.\n"
+        "DO NOT COVER: technique cues or gym programming."),
+    "General": (
+        "FOCUS ON: the one or two things in this session's data that matter most for the next session."),
+}
+
+INSIGHT_FORMAT_RULES = (
+    "FORMAT: plain sentences only — no markdown, no asterisks, no bold, no headings, no bullet points, "
+    "no labels like 'Reason:' or 'Note:'. 3-4 complete sentences, no more than 80 words, and finish your "
+    "last sentence.\n"
+    "PBs: only call a time or lift a PB if the data marks it '(NEW PB)'. If it says 'no PB recorded', "
+    "don't call it a best."
+)
+
+
+def clean_insight(text: str) -> str:
+    """Strip markdown and any checker commentary, and never end mid-sentence."""
+    t = (text or "").strip()
+    if not t or "unavailable" in t.lower():
+        return t
+    # Drop anything the fact-checker added about itself.
+    t = re.split(r"\s*(?:\*\*)?\s*(?:reason(?: for revision)?|note|explanation|changes?)\s*:\s*(?:\*\*)?",
+                 t, maxsplit=1, flags=re.I)[0]
+    t = re.sub(r"[*_#`]+", "", t)                    # markdown symbols
+    t = re.sub(r"^\s*[-•]\s+", "", t, flags=re.M)     # bullets
+    t = re.sub(r"\s+", " ", t).strip()
+    if t and t[-1] not in ".!?\"'”)":
+        # Cut back to the last full sentence (ignore decimal points like 3.98).
+        ends = [m.end() for m in re.finditer(r"[.!?](?=\s|$)", t)]
+        if ends and ends[-1] > 20:
+            t = t[:ends[-1]].strip()
+    return t
+
+
 def persona_prompt(mode: str) -> str:
     PERSONA_PROMPTS = {
         "Acceleration & Speed Coach": (
@@ -1486,6 +1544,7 @@ def auto_suggest_persona(notes: str, sets_reps_load: str, track_reps_times: str,
 # ============================================================
 
 def verify_and_revise_insight(insight: str, session_block: str, coach_label: str) -> str:
+    insight = clean_insight(insight)
     if not insight or "unavailable" in insight.lower():
         return insight
 
@@ -1494,17 +1553,20 @@ def verify_and_revise_insight(insight: str, session_block: str, coach_label: str
         "You are given SESSION DATA (the only facts allowed) and a DRAFT coaching message. "
         "Check whether the DRAFT references any specific detail — exercise name, distance, "
         "time, load number, wellness score, or event — that does NOT appear in the SESSION DATA. "
-        "Respond with exactly one line:\n"
-        "OK — if every specific detail in the draft is grounded in the session data.\n"
-        "REVISE: <corrected version> — if the draft invents or misstates a detail. "
-        "The corrected version must keep the same coach voice, tone and length, remove or fix "
-        "only the unsupported detail(s), and still open with the athlete's first name."
+        "Trends and averages described in the SESSION DATA (summaries, trend context, history) count "
+        "as grounded.\n"
+        "Respond with exactly one of:\n"
+        "OK\n"
+        "REVISE: <corrected message>\n"
+        "The corrected message must keep the same coach voice and length, change only the unsupported "
+        "detail(s), still open with the athlete's first name, and be plain text. Output NOTHING else — "
+        "no reason, no explanation, no notes, no markdown."
     )
     check_user = f"SESSION DATA:\n{session_block}\n\nDRAFT ({coach_label}):\n{insight}"
 
     result = call_claude_fast(
         [{"role": "system", "content": check_system}, {"role": "user", "content": check_user}],
-        max_tokens=300,
+        max_tokens=400,
     )
 
     if not result or "unavailable" in result.lower():
@@ -1512,12 +1574,14 @@ def verify_and_revise_insight(insight: str, session_block: str, coach_label: str
         # draft rather than blocking the athlete from getting feedback.
         return insight
 
-    result = result.strip()
+    result = re.sub(r"[*_#`]+", "", result).strip()
     if result.upper().startswith("OK"):
         return insight
     if result.upper().startswith("REVISE"):
-        revised = result.split(":", 1)[1].strip() if ":" in result else ""
-        return revised or insight
+        revised = clean_insight(result.split(":", 1)[1] if ":" in result else "")
+        meta = re.search(r"\b(draft|session data|fact.?check|revision|unsupported)\b", revised, re.I)
+        if revised and not meta and len(revised) > 0.5 * len(insight):
+            return revised
     return insight
 
 
@@ -1590,6 +1654,214 @@ def call_claude_fast(messages: list, max_tokens: int = 700) -> str:
     return out
 
 
+# ============================================================
+#  CRAFT MODEL (Malone & Buchheit, SPSR 2026, #317)
+#  Context · Retrieval & Reduction · Appraisal · Framing · Transmission
+#  - R (machine): baseline, typical error, smallest worthwhile change and
+#    z-scores are computed here in code, so the AI only receives a reduced,
+#    filtered picture of what meaningfully changed.
+#  - A (coach): anomalies and missing data are flagged for the coach to check.
+#  - F (shared): the AI drafts two points in plain coach language.
+#  - T (coach): the AI suggests; the coach decides.
+# ============================================================
+
+CRAFT_BASELINE_DAYS = 28
+CRAFT_MIN_HISTORY = 5
+
+# label, sheet column, which way is better (+1 higher, -1 lower, 0 neutral)
+CRAFT_MARKERS = [
+    ("Sleep", "Sleep_1_5", +1),
+    ("Energy", "Fatigue_1_5", +1),
+    ("Soreness", "Soreness_1_5", -1),
+    ("Mood", "Mood_1_5", +1),
+    ("Session RPE", "RPE_Post_Session", 0),
+    ("Session quality", "Session_1_5", +1),
+]
+
+
+def _craft_stats(values: pd.Series):
+    """(mean, sd, typical error, smallest worthwhile change) for an athlete's own baseline."""
+    v = pd.to_numeric(values, errors="coerce").dropna()
+    if len(v) < CRAFT_MIN_HISTORY:
+        return None
+    mean, sd = float(v.mean()), float(v.std(ddof=1))
+    diffs = v.diff().dropna()
+    te = float(diffs.std(ddof=1) / np.sqrt(2)) if len(diffs) >= 3 else sd
+    swc = 0.2 * sd
+    return mean, sd, te, swc
+
+
+def _craft_change(label, today, stats, better, unit="", fmt="{:g}"):
+    """One reduced line, and whether the change clears the noise threshold."""
+    mean, sd, te, swc = stats
+    delta = today - mean
+    thresh = max(te, swc, 0.5)      # 1-5 scales: half a point is the floor for a real change
+    z_txt = f", z {delta / sd:+.1f}" if sd > 0 else ""
+    if abs(delta) <= thresh:
+        return False, f"{label} {fmt.format(today)}{unit} (usual {mean:.1f}{unit}) — within normal variation"
+    if better == 0:
+        word = "higher than usual" if delta > 0 else "lower than usual"
+    else:
+        good = (delta > 0) == (better > 0)
+        word = f"meaningfully {'higher' if delta > 0 else 'lower'} ({'better' if good else 'worse'})"
+    return True, (f"{label} {fmt.format(today)}{unit} vs usual {mean:.1f}{unit} — {word} "
+                  f"(beyond normal day-to-day variation of ±{thresh:.1f}{unit}{z_txt})")
+
+
+def craft_reduce(df: pd.DataFrame, day: dt.date, today_vals: dict, track_text: str, gym_text: str,
+                 athlete: str) -> dict:
+    """R — Retrieval & Reduction. Returns {'meaningful': [...], 'normal': [...], 'flags': [...]}."""
+    out = {"meaningful": [], "normal": [], "flags": []}
+    if df is None or df.empty or "Date" not in df.columns:
+        out["flags"].append("No training history yet — feedback is based on today's entry only.")
+        return out
+    d = df.copy()
+    d["Date"] = pd.to_datetime(d["Date"], errors="coerce").dt.date
+    d = d.dropna(subset=["Date"]).sort_values("Date")
+    base = d[(d["Date"] < day) & (d["Date"] >= day - dt.timedelta(days=CRAFT_BASELINE_DAYS))]
+
+    # Wellness + session markers
+    for label, col, better in CRAFT_MARKERS:
+        v = today_vals.get(col)
+        try:
+            v = float(v) if v not in (None, "") else None
+        except (TypeError, ValueError):
+            v = None
+        if v is None:
+            if col in ("Sleep_1_5", "Fatigue_1_5", "Soreness_1_5", "Mood_1_5"):
+                out["flags"].append(f"{label} wasn't logged today.")
+            continue
+        if not 1 <= v <= 5:
+            out["flags"].append(f"{label} logged as {v:g} — outside the 1–5 scale, check the entry.")
+            continue
+        hist = pd.to_numeric(base.get(col, pd.Series(dtype=float)), errors="coerce")
+        hist = hist[hist > 0]
+        stats = _craft_stats(hist)
+        if not stats:
+            out["normal"].append(f"{label} {v:g}/5 (not enough history to judge a change yet)")
+            continue
+        meaningful, line = _craft_change(label, v, stats, better, "/5" if False else "")
+        out["meaningful" if meaningful else "normal"].append(line)
+
+    # Planned vs actual effort (only before the row's planned sRPE is overwritten)
+    try:
+        row = d[d["Date"] == day].iloc[-1]
+        planned = pd.to_numeric(row.get("sRPE"), errors="coerce")
+        already_logged = str(row.get("RPE_Post_Session", "") or "").strip() not in ("", "nan")
+        rpe = today_vals.get("RPE_Post_Session")
+        if pd.notna(planned) and planned > 0 and rpe and not already_logged:
+            actual10 = float(rpe) * 2
+            if abs(actual10 - planned) >= 3:
+                out["flags"].append(f"Effort felt {actual10:.0f}/10 against {planned:.0f}/10 planned — "
+                                    "was the session what the plan said it was?")
+    except Exception:
+        pass
+
+    pbs = current_pbs(athlete) if athlete else {}
+
+    # Track: today's best rep per event vs the athlete's recent session bests
+    reps = parse_track_reps(track_text)
+    if str(track_text or "").strip() and re.search(r"\d+[.:]\d", str(track_text)) and not reps:
+        out["flags"].append("Track times were entered but couldn't be matched to a distance — check them.")
+    by_ev = {}
+    for ev, t in reps:
+        by_ev.setdefault(ev, []).append(t)
+    hist_rows = d[(d["Date"] < day) & (d["Date"] >= day - dt.timedelta(days=90))]
+    for ev, ts in by_ev.items():
+        best = min(ts)
+        prev = []
+        for _, r in hist_rows.iterrows():
+            tt = [t for e, t in parse_track_reps(r.get("Track_Reps_Times", "")) if e == ev]
+            if tt:
+                prev.append(min(tt))
+        pb = pbs.get(ev, {}).get("value") if pbs.get(ev, {}).get("type") == "Track" else None
+        pb_txt = f", {pb / best * 100:.0f}% of PB" if pb else ""
+        stats = _craft_stats(pd.Series(prev)) if len(prev) >= 3 else None
+        if stats:
+            mean, sd, te, swc = stats
+            delta = mean - best                     # positive = faster than usual
+            thresh = max(te, swc, 0.01)
+            if abs(delta) > thresh:
+                word = "meaningfully faster" if delta > 0 else "meaningfully slower"
+                out["meaningful"].append(f"{ev} best {fmt_time(best)}s vs recent average {fmt_time(mean)}s — "
+                                         f"{word} than usual (noise ±{thresh:.2f}s){pb_txt}")
+            else:
+                out["normal"].append(f"{ev} best {fmt_time(best)}s (recent average {fmt_time(mean)}s) — "
+                                     f"within normal variation{pb_txt}")
+        else:
+            out["normal"].append(f"{ev} best {fmt_time(best)}s{pb_txt} (fewer than 3 previous sessions to compare)")
+        spread = (max(ts) - best) / best if len(ts) > 1 else 0
+        if spread > 0.06:
+            out["flags"].append(f"{ev} reps ranged {fmt_time(best)}–{fmt_time(max(ts))}s — a big spread; "
+                                "check timing method or whether a rep was disrupted.")
+
+    # Gym: today's top set vs recent top sets and PB
+    lifts = summarise_gym_vs_pb(gym_text, pbs) if gym_text else []
+    if str(gym_text or "").strip() and re.search(r"\d", str(gym_text)) and not lifts:
+        out["flags"].append("Gym work was entered but no lifts could be read — check the entry.")
+    for g in lifts:
+        prev = []
+        for _, r in hist_rows.iterrows():
+            for h in summarise_gym_vs_pb(r.get("Sets_Reps_Load", ""), {}):
+                if h["exercise"] == g["exercise"]:
+                    prev.append(h["est"])
+        pct = f", {g['pct']:.0f}% of PB" if g.get("pct") else ""
+        line = f"{g['exercise']} top set {fmt_set(g)}{pct}"
+        stats = _craft_stats(pd.Series(prev)) if len(prev) >= 3 else None
+        if stats:
+            mean, sd, te, swc = stats
+            thresh = max(te, swc, 1.0)
+            if abs(g["est"] - mean) > thresh:
+                word = "meaningfully heavier" if g["est"] > mean else "meaningfully lighter"
+                out["meaningful"].append(f"{line} — {word} than recent sessions (≈{mean:.0f} usual)")
+            else:
+                out["normal"].append(f"{line} — in line with recent sessions")
+        else:
+            out["normal"].append(line)
+        if g.get("pct") and g["pct"] > 112:
+            out["flags"].append(f"{g['exercise']} came in at {g['pct']:.0f}% of PB — confirm the load before "
+                                "it's saved as a PB.")
+
+    if session_setting(df, day) == "Competition":
+        out["flags"].append("Competition day — read today's numbers in that context.")
+    return out
+
+
+def craft_reduction_text(red: dict) -> str:
+    def _block(items, empty):
+        return "\n".join(f"- {x}" for x in items) if items else f"- {empty}"
+    return ("REDUCTION (computed against this athlete's own last 28 days):\n"
+            "Meaningful changes:\n" + _block(red["meaningful"], "none — nothing cleared normal variation") +
+            "\nWithin normal variation (treat as noise, not trends):\n" + _block(red["normal"], "none") +
+            "\nData flags for the coach to check:\n" + _block(red["flags"], "none"))
+
+
+def craft_context_text(first_name: str, lens: str, setting: str, upcoming: str) -> str:
+    nxt = next((ln.strip() for ln in str(upcoming).splitlines() if ln.strip()), "not planned yet")
+    return ("CONTEXT:\n"
+            f"- Audience: {first_name}, the athlete. Their coach also reads this and owns any change to the plan.\n"
+            f"- Decision this feedback serves: through the {lens.replace(' Coach', '')} lens, what should stay "
+            f"the same or change for the next session?\n"
+            f"- Session type: {setting}\n"
+            f"- Next session: {nxt}")
+
+
+CRAFT_FRAMING_RULES = (
+    "HOW TO FRAME (CRAFT model — you draft the Framing stage; the coach owns the decision):\n"
+    "- Use the REDUCTION block as your evidence. Pick the TWO points that matter most for the decision "
+    "in CONTEXT and leave everything else out.\n"
+    "- Only describe something as a drop, rise, improvement or decline if REDUCTION marks it as a "
+    "meaningful change. Anything 'within normal variation' is noise — don't present it as a trend.\n"
+    "- Tell it as dose → response → adjustment: what was done, how the athlete responded, what to keep or "
+    "adjust next session.\n"
+    "- If nothing meaningful changed, say the plan can stay as it is — don't invent a concern.\n"
+    "- Suggest, don't decide: frame any change to the plan as something to confirm with the coach.\n"
+    "- Plain coach language. Never use statistical terms (z-score, typical error, smallest worthwhile "
+    "change, variation threshold) in the feedback.\n"
+    "- It must read as written for this athlete this week — nothing that could describe any squad in any week."
+)
+
+
 def make_ai_suggestions(
         athlete_name, selected_date, session_rpe, session_quality,
         sleep, fatigue, mood, soreness, notes, sets_reps_load,
@@ -1600,15 +1872,15 @@ def make_ai_suggestions(
     df = load_tab(athlete_name)
 
     if df is None or df.empty:
-        return "No athlete data available yet.", "", ai_mode_1, ai_mode_2
+        return "No athlete data available yet.", "", ai_mode_1, ai_mode_2, []
 
     try:
         selected_date_dt = pd.to_datetime(selected_date).date()
     except Exception:
-        return "Invalid selected date.", "", ai_mode_1, ai_mode_2
+        return "Invalid selected date.", "", ai_mode_1, ai_mode_2, []
 
     if "Date" not in df.columns:
-        return "Sheet is missing a 'Date' column.", "", ai_mode_1, ai_mode_2
+        return "Sheet is missing a 'Date' column.", "", ai_mode_1, ai_mode_2, []
 
     df = df.copy()
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.date
@@ -1663,6 +1935,19 @@ def make_ai_suggestions(
         f"\nUpcoming sessions:\n{upcoming}"
     )
 
+    # ── CRAFT: R (machine reduction) + A (flags for the coach) ──
+    try:
+        craft = craft_reduce(df, selected_date_dt, {
+            "Sleep_1_5": sleep, "Fatigue_1_5": fatigue, "Soreness_1_5": soreness, "Mood_1_5": mood,
+            "RPE_Post_Session": session_rpe, "Session_1_5": session_quality,
+        }, track_reps_times if track_reps_times != "none provided" else "",
+           sets_reps_load if sets_reps_load != "none provided" else "", athlete_name)
+    except Exception as e:
+        print(f"⚠️ CRAFT reduction failed: {e}")
+        craft = {"meaningful": [], "normal": [], "flags": []}
+    craft_text = craft_reduction_text(craft)
+    _setting = session_setting(df, selected_date_dt)
+
     # ── AGENTIC STEP 1: auto-select any persona the coach left unset ──
     # If a mode wasn't manually picked in the UI, infer one from the
     # athlete's own logged text and wellness scan rather than defaulting
@@ -1688,9 +1973,14 @@ def make_ai_suggestions(
         "Do NOT mention injury or medical issues. "
         "BANNED PHRASES: looked, looks, looking, appeared, it looked like, looked controlled, looked strong — "
         "these imply visual observation. Use felt, came in, registered, held, sat, tracked, ran, moved instead. "
-        f"Always open with '{first_name},' — this is mandatory."
+        f"Always open with '{first_name},' — this is mandatory.\n\n"
+        f"YOUR LENS ({ai_mode_1}):\n{PERSONA_LENS.get(ai_mode_1, PERSONA_LENS['General'])}\n\n"
+        f"{CRAFT_FRAMING_RULES}\n\n"
+        f"{INSIGHT_FORMAT_RULES}"
     )
     user_1 = (
+        f"{craft_context_text(first_name, ai_mode_1, _setting, upcoming)}\n\n"
+        f"{craft_text}\n\n"
         f"7-day summary: {summary}\n\n"
         f"Trend context (14 days):\n{trend_context}\n\n"
         f"Recent session notes:\n{history_text}\n\n"
@@ -1705,9 +1995,10 @@ def make_ai_suggestions(
         "Reference ONLY the workout, focus, venue, RPE, sets/reps/load, track times, and notes explicitly listed above.\n"
         "If sets/reps or track times say 'none provided', do not mention them.\n"
         "Do NOT fabricate any exercise names, distances, loads, or times not in the data.\n"
+        f"Stay strictly inside the {ai_mode_1} lens described in your instructions.\n"
         "Give 2-3 specific observations grounded entirely in the logged data.\n"
         "End with one forward-looking action for the next 24-48 hours, tied to what was logged.\n"
-        "3-4 sentences. No waffle, no generics."
+        "3-4 sentences, under 80 words, plain text. No waffle, no generics."
     )
 
     persona_2 = persona_prompt(ai_mode_2)
@@ -1721,12 +2012,17 @@ def make_ai_suggestions(
         f"You MUST NOT repeat or echo anything the {ai_mode_1} would say. "
         "Your observations must come from a completely different coaching lens. "
         "Focus on what the primary coach will NOT cover. "
-        f"Always open with '{first_name},' — this is mandatory."
+        f"Always open with '{first_name},' — this is mandatory.\n\n"
+        f"YOUR LENS ({ai_mode_2}):\n{PERSONA_LENS.get(ai_mode_2, PERSONA_LENS['General'])}\n\n"
+        f"{CRAFT_FRAMING_RULES}\n\n"
+        f"{INSIGHT_FORMAT_RULES}"
     )
     # FIX #2: give the secondary coach the same trend/history context as the
     # primary coach — previously it only saw the 7-day summary, which made
     # its feedback feel generic compared to the primary insight.
     user_2 = (
+        f"{craft_context_text(first_name, ai_mode_2, _setting, upcoming)}\n\n"
+        f"{craft_text}\n\n"
         f"7-day summary: {summary}\n\n"
         f"Trend context (14 days):\n{trend_context}\n\n"
         f"Recent session notes:\n{history_text}\n\n"
@@ -1740,9 +2036,10 @@ def make_ai_suggestions(
         "If a field says 'none provided', skip it entirely.\n"
          "Do NOT fabricate exercises, loads, or times not in the data.\n"
         f"Do NOT repeat observations already covered by the {ai_mode_1} — your angle must be distinct.\n"
+        f"Stay strictly inside the {ai_mode_2} lens described in your instructions.\n"
         "Give 2 specific observations from the logged data that the primary coach would not address.\n"
         "End with ONE reflective question about their training based on what was logged.\n"
-        "3-4 sentences maximum. Be direct."
+        "3-4 sentences, under 80 words, plain text. Be direct."
     )
 
     # ── Run both calls in parallel — cuts total wait time roughly in half ──
@@ -1750,18 +2047,18 @@ def make_ai_suggestions(
         future_1 = executor.submit(
             call_claude_chat,
             [{"role": "system", "content": system_1}, {"role": "user", "content": user_1}],
-            250,
+            450,
         )
         future_2 = executor.submit(
             call_claude_chat,
             [{"role": "system", "content": system_2}, {"role": "user", "content": user_2}],
-            250,
+            450,
         )
         ai1 = future_1.result()
         ai2 = future_2.result()
 
-    ai1 = (ai1 or "").strip()
-    ai2 = (ai2 or "").strip()
+    ai1 = clean_insight(ai1)
+    ai2 = clean_insight(ai2)
 
     # ── AGENTIC STEP 2: verify-and-revise pass ──
     # Run both drafts through a narrow fact-check call against the actual
@@ -1769,12 +2066,12 @@ def make_ai_suggestions(
     # draft invented or misstated a detail. Turns generation from one-shot
     # into a minimal critique/revise loop.
     with ThreadPoolExecutor(max_workers=2) as verify_executor:
-        v_future_1 = verify_executor.submit(verify_and_revise_insight, ai1, session_block, ai_mode_1)
-        v_future_2 = verify_executor.submit(verify_and_revise_insight, ai2, session_block, ai_mode_2)
-        ai1 = (v_future_1.result() or ai1).strip()
-        ai2 = (v_future_2.result() or ai2).strip()
+        v_future_1 = verify_executor.submit(verify_and_revise_insight, ai1, user_1, ai_mode_1)
+        v_future_2 = verify_executor.submit(verify_and_revise_insight, ai2, user_2, ai_mode_2)
+        ai1 = clean_insight(v_future_1.result() or ai1)
+        ai2 = clean_insight(v_future_2.result() or ai2)
 
-    return ai1, ai2, ai_mode_1, ai_mode_2
+    return ai1, ai2, ai_mode_1, ai_mode_2, craft["flags"]
 
 
 _RADAR_PALETTE = [
@@ -3978,6 +4275,8 @@ app.index_string = """
                      border-radius: 18px; padding: 16px; box-shadow: 0 3px 8px var(--card-shadow);
                      display: flex; flex-direction: column; gap: 10px; }
           .pb-head { display: flex; align-items: center; justify-content: space-between; }
+          .ai-card-amber { border-left: 4px solid #f5a524 !important; background: rgba(245,165,36,0.08) !important; }
+          .ai-card-amber li { font-size: 13.5px; line-height: 1.45; color: var(--text); }
           .pb-head-btns { display: flex; gap: 6px; }
           .pb-title-btn { background: transparent; border: none; padding: 6px 0; display: flex; align-items: center;
                           gap: 8px; cursor: pointer; min-height: 36px; }
@@ -5886,7 +6185,7 @@ def save_and_ai(
     track_reps_times = ai_normalise_track_text(track_reps_times, _wk)
     sets_reps_load = ai_normalise_gym_text(sets_reps_load, _wk)
 
-    ai1, ai2, ai_mode_1, ai_mode_2 = make_ai_suggestions(
+    ai1, ai2, ai_mode_1, ai_mode_2, coach_flags = make_ai_suggestions(
         athlete_name=athlete_name, selected_date=selected_date_dt,
         session_rpe=rpe, session_quality=session_quality,
         sleep=sleep, fatigue=fatigue, mood=mood, soreness=soreness,
@@ -9182,7 +9481,6 @@ def debug_dashboard(tab_name):
     except Exception as e:
         import traceback
         return jsonify({"error": str(e), "trace": traceback.format_exc()})
-
 
 
 if __name__ == "__main__":
