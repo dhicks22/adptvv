@@ -767,15 +767,35 @@ def load_tab(tab_name: str) -> pd.DataFrame:
 _squad_cache = {}
 SQUAD_CACHE_TTL = 60
 
+import threading as _threading
+_tab_locks = {}
+_tab_locks_guard = _threading.Lock()
+
+
 def load_tab_cached(tab_name: str) -> pd.DataFrame:
+    """
+    Sheet read shared by every callback for 60 s. A tap on the calendar used to
+    trigger four separate Google Sheets downloads; now the first one fetches and
+    the others reuse it. A per-tab lock stops simultaneous callbacks from all
+    fetching at once. Any write to the tab clears it (see _invalidate_tab).
+    """
     now = time.time()
-    if tab_name in _squad_cache:
-        ts, df = _squad_cache[tab_name]
-        if now - ts < SQUAD_CACHE_TTL:
-            return df
-    df = load_tab(tab_name)
-    _squad_cache[tab_name] = (now, df)
-    return df
+    hit = _squad_cache.get(tab_name)
+    if hit and now - hit[0] < SQUAD_CACHE_TTL:
+        return hit[1]
+    with _tab_locks_guard:
+        lock = _tab_locks.setdefault(tab_name, _threading.Lock())
+    with lock:
+        hit = _squad_cache.get(tab_name)
+        if hit and time.time() - hit[0] < SQUAD_CACHE_TTL:
+            return hit[1]
+        df = load_tab(tab_name)
+        _squad_cache[tab_name] = (time.time(), df)
+        return df
+
+
+def _invalidate_tab(tab_name: str):
+    _squad_cache.pop(tab_name, None)
 
 def write_row(tab_name: str, row_idx_0: int, payload: dict):
     if sh is None:
@@ -798,6 +818,7 @@ def write_row(tab_name: str, row_idx_0: int, payload: dict):
             row[j] = "" if value is None else str(value)
 
     ws.update(values=[row], range_name=f"A{row_number}")
+    _invalidate_tab(tab_name)
 
 
 def append_row_for_date(tab_name: str, date_obj: dt.date, payload: dict) -> int:
@@ -821,6 +842,7 @@ def append_row_for_date(tab_name: str, date_obj: dt.date, payload: dict) -> int:
             new_row[headers.index(col_name)] = "" if value is None else str(value)
 
     ws.append_row(new_row, value_input_option="USER_ENTERED")
+    _invalidate_tab(tab_name)
     return len(sheet_vals) - 1
 
 
@@ -4277,6 +4299,13 @@ app.index_string = """
           .pb-head { display: flex; align-items: center; justify-content: space-between; }
           .ai-card-amber { border-left: 4px solid #f5a524 !important; background: rgba(245,165,36,0.08) !important; }
           .ai-card-amber li { font-size: 13.5px; line-height: 1.45; color: var(--text); }
+          /* Touch: no double-tap-zoom wait, and every tap shows a response straight away */
+          html, body { touch-action: manipulation; }
+          button, a, label, .nav-item, .calendar-day, .ci-btn, .pb-tile, .ts-card, [role="button"] {
+            touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+          button:active, .nav-item:active, .calendar-day:active, .ci-btn:active, label:active,
+          .pb-seg-btn:active, .sprintq-pill:active {
+            transform: scale(0.96); filter: brightness(1.15); transition: transform 0.05s, filter 0.05s; }
           .pb-head-btns { display: flex; gap: 6px; }
           .pb-title-btn { background: transparent; border: none; padding: 6px 0; display: flex; align-items: center;
                           gap: 8px; cursor: pointer; min-height: 36px; }
@@ -5453,37 +5482,6 @@ def close_session_context(n, style):
 
 
 @app.callback(
-    [Output("home-view", "style"),
-     Output("calendar-view", "style"),
-     Output("graphs-view", "style"),
-     Output("ai-view", "style"),
-     Output("squad-view", "style"),
-     Output("bottom-nav-click", "data")],
-    [Input("nav-home", "n_clicks"),
-     Input("nav-calendar", "n_clicks"),
-     Input("nav-graphs", "n_clicks"),
-     Input("nav-ai", "n_clicks"),
-     Input("nav-squad", "n_clicks"),
-     Input("bottom-nav-click", "data")],      # ← now also an Input
-)
-def show_section(h, c, g, a, s, store_tab):
-    ctx = callback_context
-    if not ctx.triggered:
-        tab = store_tab or "home"
-    else:
-        triggered = ctx.triggered[0]["prop_id"].split(".")[0]
-        if triggered == "bottom-nav-click":
-            # store changed (e.g. squad card click) — follow it
-            tab = store_tab or "home"
-        else:
-            tab = triggered.replace("nav-", "")
-    out = [{"display": "block"} if key == tab else {"display": "none"}
-           for key in ["home", "calendar", "graphs", "ai", "squad"]]
-    out.append(tab)
-    return out
-
-
-@app.callback(
     Output("calendar-window-start", "data"),
     Output("calendar-window-label", "children"),
     Input("athlete-dropdown", "value"),
@@ -5519,7 +5517,7 @@ def update_calendar_window(athlete_tab, prev_clicks, next_clicks, current_month)
 def update_calendar(athlete_tab, window_start, selected_date):
     if not athlete_tab:
         return "Select athlete."
-    df = load_tab(athlete_tab)
+    df = load_tab_cached(athlete_tab)
     month_date = pd.to_datetime(window_start).date().replace(day=1) if window_start else dt.date.today().replace(day=1)
     return build_month_calendar(df, month_date, selected_date)
 
@@ -5741,7 +5739,7 @@ def on_day_click(n_clicks_list, close_n, edit_n, athlete_name):
     if not athlete_name:
         return False, no_update, no_update, {"display": "block"}, clicked_date_str, header
 
-    df = load_tab(athlete_name)
+    df = load_tab_cached(athlete_name)
     if df is None or df.empty or "Date" not in df.columns:
         return False, no_update, no_update, {"display": "block"}, clicked_date_str, header
 
@@ -5943,7 +5941,7 @@ def toggle_unplanned_fields(selected_date, athlete_name):
     if not selected_date or not athlete_name:
         raise PreventUpdate
     try:
-        df = load_tab(athlete_name)
+        df = load_tab_cached(athlete_name)
         if df is None or df.empty or "Date" not in df.columns:
             return {"display": "block"}
         df = df.copy()
@@ -5972,7 +5970,7 @@ def populate_session_context(selected_date, athlete_name):
     if not selected_date or not athlete_name:
         raise PreventUpdate
 
-    df = load_tab(athlete_name)
+    df = load_tab_cached(athlete_name)
     if df is None or df.empty or "Date" not in df.columns:
         return no_update, no_update, no_update
 
@@ -6640,30 +6638,6 @@ def render_pb_card(athlete_id, saved, _refresh, dismissed):
 
 
 @app.callback(
-    Output("pb-collapsed", "data"),
-    Input("pb-collapse-btn", "n_clicks"),
-    State("pb-collapsed", "data"),
-    prevent_initial_call=True,
-)
-def toggle_pb_collapse(n, collapsed):
-    if not n:
-        raise PreventUpdate
-    return not bool(collapsed)
-
-
-@app.callback(
-    Output("pb-card-body", "style"),
-    Output("pb-summary", "style"),
-    Output("pb-chevron", "children"),
-    Input("pb-collapsed", "data"),
-)
-def apply_pb_collapse(collapsed):
-    if collapsed:
-        return {"display": "none"}, {"display": "block"}, "▸"
-    return {"display": "block"}, {"display": "none"}, "▾"
-
-
-@app.callback(
     Output("share-card-title", "children", allow_duplicate=True),
     Input("btn-share-card", "n_clicks"),
     prevent_initial_call=True,
@@ -6872,19 +6846,6 @@ def show_pb_share_card(n, _any, athlete_id, saved):
     return style, "Share a PB", html.Iframe(srcDoc=build_pb_share_html(athlete_id, pick),
                               style={"width": "100%", "height": "680px", "border": "none",
                                      "background": "#111", "display": "block"})
-
-
-@app.callback(
-    Output("pb-form-wrap", "style"),
-    Output("pb-edit-btn", "children"),
-    Output("pb-date", "value"),
-    Input("pb-edit-btn", "n_clicks"),
-    prevent_initial_call=True,
-)
-def toggle_pb_form(n):
-    show = bool(n) and n % 2 == 1
-    return ({"display": "flex"} if show else {"display": "none"},
-            "Close" if show else "Update", str(today_adl()))
 
 
 @app.callback(
@@ -7820,7 +7781,7 @@ def show_share_card(n, close_n, athlete_id, current_style):
     session_sub = ""
 
     try:
-        df = load_tab(athlete_id)
+        df = load_tab_cached(athlete_id)
         if not df.empty:
             streak, _ = compute_streaks(df)
             dow = today.weekday()
@@ -8430,6 +8391,7 @@ def write_cells(tab_name: str, row_idx_0: int, payload: dict):
             updates.append({"range": a1, "values": [["" if value is None else value]]})
     if updates:
         ws.batch_update(updates, value_input_option="USER_ENTERED")
+    _invalidate_tab(tab_name)
 
 
 def _checkin_form(selected, stale_days, editing=False):
@@ -8497,7 +8459,7 @@ def render_checkin(athlete_id, _saved, auth_data):
         return None, {}
     today = today_adl()
     try:
-        df = load_tab(athlete_id)
+        df = load_tab_cached(athlete_id)
     except Exception:
         return None, {}
     vals = _day_wellness(df, today)
@@ -8517,30 +8479,9 @@ def edit_checkin(clicks, athlete_id):
     if not athlete_id or not clicks or not any((n or 0) > 0 for n in clicks):
         raise PreventUpdate
     today = today_adl()
-    df = load_tab(athlete_id)
+    df = load_tab_cached(athlete_id)
     vals = _day_wellness(df, today)
     return _checkin_form(vals, days_since_last_data(df, today), editing=True), vals
-
-
-@app.callback(
-    Output("checkin-store", "data", allow_duplicate=True),
-    Output({"type": "ci-btn", "q": ALL, "v": ALL}, "className"),
-    Input({"type": "ci-btn", "q": ALL, "v": ALL}, "n_clicks"),
-    State("checkin-store", "data"),
-    prevent_initial_call=True,
-)
-def pick_checkin(_clicks, data):
-    ctx = callback_context
-    if not ctx.triggered or not ctx.triggered[0].get("value"):
-        raise PreventUpdate
-    trig = json.loads(ctx.triggered[0]["prop_id"].rsplit(".", 1)[0])
-    data = dict(data or {})
-    data[trig["q"]] = trig["v"]
-    classes = [
-        "ci-btn selected" if data.get(o["id"]["q"]) == o["id"]["v"] else "ci-btn"
-        for o in ctx.outputs_list[1]
-    ]
-    return data, classes
 
 
 @app.callback(
@@ -8771,44 +8712,6 @@ def update_chart_takeaways(athlete_id, _n):
 
 
 @app.callback(
-    Output("session-inputs", "data", allow_duplicate=True),
-    Input({"type": "sl-btn", "q": ALL, "v": ALL}, "n_clicks"),
-    State("session-inputs", "data"),
-    prevent_initial_call=True,
-)
-def pick_session_input(_clicks, data):
-    ctx = callback_context
-    if not ctx.triggered or not ctx.triggered[0].get("value"):
-        raise PreventUpdate
-    trig = json.loads(ctx.triggered[0]["prop_id"].rsplit(".", 1)[0])
-    data = dict(data or {})
-    data[trig["q"]] = trig["v"]
-    return data
-
-
-@app.callback(
-    Output({"type": "sl-btn", "q": ALL, "v": ALL}, "className"),
-    Input("session-inputs", "data"),
-)
-def sync_session_input_pills(data):
-    ctx = callback_context
-    data = data or {}
-    return ["ci-btn selected" if data.get(o["id"]["q"]) == o["id"]["v"] else "ci-btn"
-            for o in ctx.outputs_list]
-
-
-@app.callback(
-    Output("log-wellness-wrap", "style"),
-    Input("log-wellness-toggle", "n_clicks"),
-    prevent_initial_call=True,
-)
-def toggle_log_wellness(n):
-    if not n:
-        raise PreventUpdate
-    return {"display": "block"} if n % 2 == 1 else {"display": "none"}
-
-
-@app.callback(
     Output("garmin-status-badge", "children"),
     Input("athlete-dropdown", "value"),
     Input("today-date", "children"),
@@ -8817,7 +8720,7 @@ def toggle_log_wellness(n):
 def update_garmin_badge(athlete_id, _today):
     if not athlete_id: raise PreventUpdate
     try:
-        df = load_tab(athlete_id)
+        df = load_tab_cached(athlete_id)
         token, _ = garmin_get_athlete_tokens(df)
         garmin_linked = bool(token)
     except Exception:
@@ -9481,6 +9384,151 @@ def debug_dashboard(tab_name):
     except Exception as e:
         import traceback
         return jsonify({"error": str(e), "trace": traceback.format_exc()})
+
+
+# ============================================================
+#  INSTANT TAPS — these only change what's on screen, so they run in the
+#  phone's browser instead of making a round trip to the server.
+# ============================================================
+app.clientside_callback(
+    """
+    function(h, c, g, a, s, storeTab) {
+        var ctx = dash_clientside.callback_context;
+        var tab = storeTab || "home";
+        if (ctx.triggered && ctx.triggered.length) {
+            var id = ctx.triggered[0].prop_id.split(".")[0];
+            if (id !== "bottom-nav-click" && id.indexOf("nav-") === 0) { tab = id.replace("nav-", ""); }
+        }
+        var keys = ["home", "calendar", "graphs", "ai", "squad"];
+        var out = keys.map(function(k){ return {display: k === tab ? "block" : "none"}; });
+        out.push(tab);
+        return out;
+    }
+    """,
+    [Output("home-view", "style"),
+     Output("calendar-view", "style"),
+     Output("graphs-view", "style"),
+     Output("ai-view", "style"),
+     Output("squad-view", "style"),
+     Output("bottom-nav-click", "data")],
+    [Input("nav-home", "n_clicks"),
+     Input("nav-calendar", "n_clicks"),
+     Input("nav-graphs", "n_clicks"),
+     Input("nav-ai", "n_clicks"),
+     Input("nav-squad", "n_clicks"),
+     Input("bottom-nav-click", "data")],
+)
+
+# Tap rows in the session log (effort, quality, wellness)
+app.clientside_callback(
+    """
+    function(clicks, data) {
+        var ctx = dash_clientside.callback_context;
+        if (!ctx.triggered || !ctx.triggered.length || !ctx.triggered[0].value) {
+            return dash_clientside.no_update;
+        }
+        var id = JSON.parse(ctx.triggered[0].prop_id.split(".n_clicks")[0]);
+        var out = Object.assign({}, data || {});
+        out[id.q] = id.v;
+        return out;
+    }
+    """,
+    Output("session-inputs", "data", allow_duplicate=True),
+    Input({"type": "sl-btn", "q": ALL, "v": ALL}, "n_clicks"),
+    State("session-inputs", "data"),
+    prevent_initial_call=True,
+)
+app.clientside_callback(
+    """
+    function(data, ids) {
+        data = data || {};
+        return (ids || []).map(function(id){ return data[id.q] === id.v ? "ci-btn selected" : "ci-btn"; });
+    }
+    """,
+    Output({"type": "sl-btn", "q": ALL, "v": ALL}, "className"),
+    Input("session-inputs", "data"),
+    State({"type": "sl-btn", "q": ALL, "v": ALL}, "id"),
+)
+
+# Morning check-in taps
+app.clientside_callback(
+    """
+    function(clicks, data, ids) {
+        var ctx = dash_clientside.callback_context;
+        if (!ctx.triggered || !ctx.triggered.length || !ctx.triggered[0].value) {
+            return [dash_clientside.no_update, dash_clientside.no_update];
+        }
+        var id = JSON.parse(ctx.triggered[0].prop_id.split(".n_clicks")[0]);
+        var out = Object.assign({}, data || {});
+        out[id.q] = id.v;
+        var classes = (ids || []).map(function(i){ return out[i.q] === i.v ? "ci-btn selected" : "ci-btn"; });
+        return [out, classes];
+    }
+    """,
+    Output("checkin-store", "data", allow_duplicate=True),
+    Output({"type": "ci-btn", "q": ALL, "v": ALL}, "className"),
+    Input({"type": "ci-btn", "q": ALL, "v": ALL}, "n_clicks"),
+    State("checkin-store", "data"),
+    State({"type": "ci-btn", "q": ALL, "v": ALL}, "id"),
+    prevent_initial_call=True,
+)
+
+# "Add wellness" toggle in the session log
+app.clientside_callback(
+    """
+    function(n) {
+        if (!n) { return dash_clientside.no_update; }
+        return {display: (n % 2 === 1) ? "block" : "none"};
+    }
+    """,
+    Output("log-wellness-wrap", "style"),
+    Input("log-wellness-toggle", "n_clicks"),
+    prevent_initial_call=True,
+)
+
+# PB card: open/close the form
+app.clientside_callback(
+    """
+    function(n) {
+        var show = !!n && (n % 2 === 1);
+        var d = new Date();
+        var today = d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" +
+                    String(d.getDate()).padStart(2, "0");
+        return [{display: show ? "flex" : "none"}, show ? "Close" : "Update", today];
+    }
+    """,
+    Output("pb-form-wrap", "style"),
+    Output("pb-edit-btn", "children"),
+    Output("pb-date", "value"),
+    Input("pb-edit-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+
+# PB card: fold / unfold
+app.clientside_callback(
+    """
+    function(n, collapsed) {
+        if (!n) { return dash_clientside.no_update; }
+        return !collapsed;
+    }
+    """,
+    Output("pb-collapsed", "data"),
+    Input("pb-collapse-btn", "n_clicks"),
+    State("pb-collapsed", "data"),
+    prevent_initial_call=True,
+)
+app.clientside_callback(
+    """
+    function(collapsed) {
+        if (collapsed) { return [{display: "none"}, {display: "block"}, "▸"]; }
+        return [{display: "block"}, {display: "none"}, "▾"];
+    }
+    """,
+    Output("pb-card-body", "style"),
+    Output("pb-summary", "style"),
+    Output("pb-chevron", "children"),
+    Input("pb-collapsed", "data"),
+)
 
 
 if __name__ == "__main__":
