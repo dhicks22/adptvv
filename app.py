@@ -13,6 +13,7 @@ import os
 import re
 import json
 import time
+import functools
 import datetime as dt
 from zoneinfo import ZoneInfo
 
@@ -692,6 +693,7 @@ def load_tab(tab_name: str) -> pd.DataFrame:
         "EWMA 28", "EMWA 28", "EWMA 7", "EMWA 7",
         "Sleep_1_5", "Fatigue_1_5", "Mood_1_5", "Soreness_1_5",
         "RPE_Post_Session", "Session_1_5",
+        "Track_Reps_Times", "Athlete_Notes",
     }
     if formatted_values and len(formatted_values) > 1:
         fmt_headers = formatted_values[0]
@@ -2782,12 +2784,15 @@ PB_HEADERS = ["Athlete", "Type", "Event", "Value", "Unit", "Reps", "Est_1RM", "D
               "Setting"]   # Setting: Training / Competition (track only)
 
 SPRINT_EVENTS = ["10m", "20m", "30m", "40m", "50m", "60m", "80m", "100m", "120m", "150m",
-                 "200m", "250m", "300m", "400m", "Fly 10m", "Fly 20m", "Fly 30m",
+                 "200m", "250m", "300m", "400m", "500m", "600m", "800m", "1000m", "1200m", "1500m",
+                 "Fly 10m", "Fly 20m", "Fly 30m",
                  "60mH", "100mH", "110mH", "400mH"]
 GYM_EVENTS = {
     "Back squat": "kg", "Front squat": "kg", "Deadlift": "kg", "Trap bar deadlift": "kg",
     "Power clean": "kg", "Hang clean": "kg", "Bench press": "kg", "Hip thrust": "kg",
     "RDL": "kg", "Split squat": "kg", "Weighted chin-up": "kg",
+    "Snatch": "kg", "Push press": "kg", "Step-up": "kg",
+    "High pull": "kg", "Quarter squat": "kg", "Shoulder press": "kg",
     "Countermovement jump": "cm", "Standing long jump": "cm",
 }
 
@@ -2939,36 +2944,46 @@ def fmt_time(t: float) -> str:
 
 # A distance must carry an "m" (30m, 150 m, 110mH) or a "fly" prefix (fly 20).
 _DIST_RE = re.compile(
-    r"(?P<fly>\bfly(?:ing)?\s*)?(?<![\d.:])(?P<d>\d{2,3})"
+    r"(?P<fly>\bfly(?:ing)?\s*)?(?<![\d.:,])(?P<d>\d{2,4})"
     r"(?:\s*(?P<m>m(?:etres|eters|etre|eter)?)(?P<h>\s?h(?:urdles?)?)?(?![a-z]))?",
     re.I)
-_TIME_RE = re.compile(r"(?<![\d.:@x])(\d{1,2}:\d{2}(?:\.\d{1,3})?|\d{1,3}\.\d{1,3})\s*s?(?![\d.:%]|\s*kg)",
-                      re.I)
-_NOT_TIME_BEFORE = re.compile(r"(rpe|@|x|sets?|reps?|rest|kg)\s*$", re.I)
+_TIME_RE = re.compile(r"(?<![\d.:x])(\d{1,2}:\d{2}(?:\.\d{1,3})?|\d{1,3}\.\d{1,3}"
+                      r"|\d{1,3}(?=\s*s(?:ecs?|econds?)?\b))\s*s?(?![\d.:%]|\s*kg)", re.I)
+_NOT_TIME_BEFORE = re.compile(r"(rpe|x|sets?|reps?|rest|kg)\s*$", re.I)
+# Distances written without "m" ("2x150 17.8", "30 - 4.05") count only for usual rep distances.
+_BARE_DISTS = set(range(10, 610, 10)) | {800, 1000, 1200, 1500, 1600, 2000}
+_BARE_BEFORE = re.compile(r"[x×]\s*$", re.I)
+_BARE_AFTER = re.compile(r"^\s*[-–:=@]\s*\d")
 
 
 def parse_track_reps(text) -> list:
     """
     Pull (event, seconds) pairs out of free-text track notes, e.g.
       "30m 3.95, 3.92 / fly 20 1.98 2.01 / 300m in 38.2 / 2x150m 17.8, 18.1"
+      "3 x 60m @ 7.2, 7.15", "2x150 17.8 18.1", "30 - 4.05", "4.05 (30m)",
+      "800m 2:05", "200m tempo x6 30s", "30m 4,05 4,10"
     Anything that isn't a plausible time for that distance is ignored.
     """
     text = str(text or "")
     if not text.strip():
         return []
-    dists = []
+    if not re.search(r"\d\.\d", text):            # "4,05" written with a decimal comma
+        text = re.sub(r"(?<=\d),(?=\d{1,2}(?!\d))", ".", text)
+    cands = []
     for m in _DIST_RE.finditer(text):
         d = int(m.group("d"))
-        if not (m.group("m") or m.group("fly")) or not 10 <= d <= 600:
-            continue
         fly = bool(m.group("fly"))
+        bare = not (m.group("m") or fly)
+        if not 10 <= d <= 2000:
+            continue
+        if bare and not (d in _BARE_DISTS and (_BARE_BEFORE.search(text[:m.start()])
+                                               or _BARE_AFTER.match(text[m.end():]))):
+            continue
         hurdles = bool(m.group("h")) and not fly
         ev = f"Fly {d}m" if fly else (f"{d}mH" if hurdles else f"{d}m")
-        dists.append((m.start(), m.end(), d, fly, ev))
-    out = []
-    for i, (s, e, d, fly, ev) in enumerate(dists):
-        stop = dists[i + 1][0] if i + 1 < len(dists) else len(text)
-        chunk = text[e:stop]
+        cands.append((m.start(), m.end(), d, fly, ev, bare))
+
+    def _times(chunk, d, fly):
         times = []
         for tm in _TIME_RE.finditer(chunk):
             if _NOT_TIME_BEFORE.search(chunk[:tm.start()]):
@@ -2983,7 +2998,28 @@ def parse_track_reps(text) -> list:
         if times:
             best = min(times)
             times = [t for t in times if t <= best * 1.25]   # drop stray numbers
-            out.extend((ev, t) for t in times)
+        return times
+
+    # A distance written without "m" that turns out to have no times (e.g. "x10")
+    # was a rep count, not a distance: drop it so it doesn't cut off the one before.
+    for _ in range(4):
+        found = []
+        for i, (s0, e, d, fly, ev, bare) in enumerate(cands):
+            stop = cands[i + 1][0] if i + 1 < len(cands) else len(text)
+            found.append(_times(text[e:stop], d, fly))
+        drop = [i for i, (c, t) in enumerate(zip(cands, found)) if c[5] and not t]
+        if not drop:
+            break
+        cands = [c for i, c in enumerate(cands) if i not in drop]
+    else:
+        found = [[] for _ in cands]
+
+    out = []
+    for i, (s0, e, d, fly, ev, bare) in enumerate(cands):
+        times = found[i]
+        if not times and i == 0:                       # "4.05, 4.01 (30m)": times before
+            times = _times(text[:s0], d, fly)
+        out.extend((ev, t) for t in times)
     return out
 
 
@@ -3093,23 +3129,43 @@ def session_setting(df: pd.DataFrame, day) -> str:
 # ---------- Gym: read lifts from the Sets × Reps × Load box ----------
 # Most specific names first so "front squat" isn't read as "squat".
 _GYM_ALIASES = [
+    # Claimed but not tracked (None), so their words aren't misread as a main lift:
+    (None, r"\bsl\s*(?:dead\s*lifts?|dl|rdl)s?\b|single[\s-]*leg\s*(?:dead\s*lifts?|rdls?)"),
+    (None, r"(?:\bdl\s*|seated\s*|standing\s*|\bsl\s*|smith\s*machine\s*)?calf\s*raises?"),
+    (None, r"(?:\bdl\s*)?(?:back|hyper)\s*/?\s*(?:hyper\s*)?extensions?|reverse\s*hypers?"),
+    (None, r"trap\s*bar\s*jumps?|box\s*jumps?|drop\s*jumps?|(?:db\s*)?split\s*snatch(?:es)?|landmine(?:\s*press)?"
+           r"|plyo\s*push[\s-]*ups?|push[\s-]*ups?|upright\s*rows?|bent\s*over\s*rows?|(?:barbell|bicep|db|hammer)\s*curls?"
+           r"|lateral\s*raises?|verkoshansky\s*swings?|semi[\s-]*squats?|squat\s*jumps?|jump\s*squats?"
+           r"|copenhagen[^\n,;]*|russian\s*twists?"),
+    ("Quarter squat", r"(?:split\s*foot\s*)?(?:1/4|quarter)\s*sq\w*"),
+    ("High pull", r"high\s*pulls?"),
+    ("Shoulder press", r"(?:standing\s*)?(?:shoulder|overhead)\s*press(?:es)?|\bohp\b"),
     ("Front squat", r"front\s*squats?|\bfs\b"),
-    ("Split squat", r"(?:bulgarian\s*)?split\s*squats?|\bbss\b"),
+    ("Split squat", r"(?:bulgarian\s*)?split\s*squats?|\bbss\b|\brfess\b"),
     ("Back squat", r"back\s*squats?|squats?|\bbs\b"),
-    ("Trap bar deadlift", r"trap\s*bar(?:\s*dead\s*lifts?)?|hex\s*bar|\btbdl\b"),
+    ("Trap bar deadlift", r"trap\s*bar\s*dl\b|trap\s*bar(?:\s*dead\s*lifts?)?|hex\s*bar|\btbdl\b|\btb\s*dl\b|trap\s*bar\s*dl\b"),
     ("RDL", r"\brdls?\b|romanian\s*dead\s*lifts?"),
     ("Deadlift", r"dead\s*lifts?|\bdl\b"),
     ("Hang clean", r"hang(?:\s*power)?\s*cleans?|\bhpc\b|\bhc\b"),
     ("Power clean", r"power\s*cleans?|cleans?|\bpc\b"),
-    ("Bench press", r"bench(?:\s*press)?|\bbp\b"),
+    ("Bench press", r"bench(?!es)(?:\s*press)?|\bbp\b"),
     ("Hip thrust", r"hip\s*thrusts?|\bht\b"),
     ("Weighted chin-up", r"(?:weighted\s*)?(?:chin|pull)[\s-]*ups?"),
+    ("Snatch", r"(?:hang\s*|power\s*)*snatch(?:es)?"),
+    ("Push press", r"push\s*press(?:es)?"),
+    ("Step-up", r"step[\s-]*ups?"),
     ("Countermovement jump", r"\bcmj\b|counter\s*movement\s*jumps?"),
     ("Standing long jump", r"standing\s*long\s*jumps?|\bslj\b|broad\s*jumps?"),
 ]
 _GYM_ALIAS_RE = [(name, re.compile(pat, re.I)) for name, pat in _GYM_ALIASES]
-_PAIR_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(kg)?\s*[x×*]\s*(\d+(?:\.\d+)?)\s*(kg)?", re.I)
-_LOAD_AFTER_RE = re.compile(r"^\s*(?:@|at)?\s*(\d{2,3}(?:\.\d+)?)\s*(kg)?(?!\s*%)", re.I)
+_PAIR_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(kg)?\s*[x×*]\s*(\d+(?:\.\d+)?)\s*(kg)?(?!\s*(?:[\"”'’]|s\b|secs?\b|sec\b|m\b))", re.I)
+_LOAD_AFTER_RE = re.compile(r"^\s*(?:@|at|with|\+)?\s*(\d{2,3}(?:\.\d+)?)\s*(kg)?(?![\d.]*\s*(?:%|s\b|sec|[\"”]))", re.I)
+_KG_SOON_RE = re.compile(r"^[^\n]{0,25}?(\d{2,3}(?:\.\d+)?)\s*kg", re.I)
+_LOAD_BEFORE_RE = re.compile(r"(\d{2,3}(?:\.\d+)?)\s*(kg)?(?![\d.%x×*])", re.I)
+_SETS_OF_RE = re.compile(r"(\d{1,2})\s*sets?\s*(?:of|x)\s*(\d{1,2})(?:\s*reps?)?\s*(?:@|at|with)?\s*"
+                         r"(\d{2,3}(?:\.\d+)?)\s*(?:kg)?(?![\d.]*\s*%)", re.I)
+_KG_REPS_RE = re.compile(r"(\d{2,3}(?:\.\d+)?)\s*kg\s*(?:for|x|×)?\s*(\d{1,2})\s*reps?\b", re.I)
+_REPS_AT_RE = re.compile(r"(\d{1,2})\s*reps?\s*(?:@|at|with)\s*(\d{2,3}(?:\.\d+)?)\s*(?:kg)?(?![\d.]*\s*%)", re.I)
 _CM_RE = re.compile(r"(?<![\d.])(\d{2,3}(?:\.\d+)?)\s*(cm)?(?![\d.%])", re.I)
 
 
@@ -3140,6 +3196,8 @@ def parse_gym_sets(text) -> list:
     """
     out = []
     for name, chunk in _gym_segments(text):
+        if not name:
+            continue
         unit = GYM_EVENTS.get(name, "kg")
         if unit == "cm":
             for m in _CM_RE.finditer(chunk):
@@ -3147,7 +3205,24 @@ def parse_gym_sets(text) -> list:
                 if 15 <= v <= 400:
                     out.append((name, v, 1))
             continue
+        used = []
+        for rx, kind in ((_SXRXL_RE, "sxrxl"), (_SETS_OF_RE, "sets_of"), (_KG_REPS_RE, "kg_reps"),
+                         (_REPS_AT_RE, "reps_at")):
+            for m in rx.finditer(chunk):
+                if kind == "sxrxl":
+                    reps, load = float(m.group(2)), float(m.group(3))
+                elif kind == "sets_of":
+                    reps, load = float(m.group(2)), float(m.group(3))
+                elif kind == "kg_reps":
+                    load, reps = float(m.group(1)), float(m.group(2))
+                else:
+                    reps, load = float(m.group(1)), float(m.group(2))
+                if 10 <= load <= 400 and 1 <= reps <= 12:
+                    out.append((name, load, int(reps)))
+                    used.append((m.start(), m.end()))
         for m in _PAIR_RE.finditer(chunk):
+            if any(m.start() < e and m.end() > s0 for s0, e in used):
+                continue
             a, a_kg, b, b_kg = float(m.group(1)), m.group(2), float(m.group(3)), m.group(4)
             load = reps = None
             after = _LOAD_AFTER_RE.match(chunk[m.end():])
@@ -3157,6 +3232,14 @@ def parse_gym_sets(text) -> list:
                 load, reps = a, b
             elif (b_kg or b >= 20) and a <= 12:            # reps x load
                 load, reps = b, a
+            elif a <= 12 and b <= 12:
+                soon = _KG_SOON_RE.match(chunk[m.end():])    # "5x3@80% -60kg"
+                before = [x for x in _LOAD_BEFORE_RE.finditer(chunk[:m.start()])
+                          if x.group(2) or float(x.group(1)) >= 20]
+                if soon:
+                    reps, load = b, float(soon.group(1))
+                elif before:                                   # "60kg 3x3": load written first
+                    reps, load = b, float(before[-1].group(1))
             if load and reps and 10 <= load <= 400 and 1 <= reps <= 12:
                 out.append((name, load, int(reps)))
     return out
@@ -3212,37 +3295,333 @@ def gym_context_line(text, athlete: str) -> str:
 
 
 
-# ---------- Reps written in Athlete_Notes ----------
+# ---------- Reading reps in the context of the planned session ----------
+# Athletes often log just the numbers ("17.7 17.3 17.4", "A1 5x3x60kg"): the
+# distance and the exercise names live in the coach's Workout / Key_Distance
+# columns. These helpers use that plan to work out what the numbers mean, and
+# rewrite them in a form the normal readers understand (analysis copy only).
+
+# Typical average speed (m/s) for a trained sprinter over each distance,
+# used to decide which planned distance a bare time belongs to.
+_EXP_SPEED = [(10, 5.3), (20, 6.2), (30, 6.9), (40, 7.4), (50, 7.8), (60, 8.1), (80, 8.6),
+              (100, 8.9), (120, 8.9), (150, 8.8), (200, 8.5), (250, 8.2), (300, 7.9),
+              (400, 7.3), (600, 6.6), (800, 6.4), (1000, 6.0), (1500, 5.7), (2000, 5.5)]
+
+
+def _expected_speed(d: float) -> float:
+    pts = _EXP_SPEED
+    if d <= pts[0][0]:
+        return pts[0][1]
+    for (d0, v0), (d1, v1) in zip(pts, pts[1:]):
+        if d <= d1:
+            return v0 + (v1 - v0) * (d - d0) / (d1 - d0)
+    return pts[-1][1]
+
+
+_WK_SECTION_RE = re.compile(r"\b(PRE|TRACK|GYM|POST|WARMUP(?:/PREHAB)?)\s*:", re.I)
+
+
+def _workout_section(workout: str, which: str) -> str:
+    """Text of one section ('TRACK' or 'GYM') of a planned workout, or all of it if unlabelled."""
+    w = str(workout or "")
+    marks = [(m.start(), m.end(), m.group(1).upper()) for m in _WK_SECTION_RE.finditer(w)]
+    if not marks:
+        return w
+    parts = [w[e:(marks[i + 1][0] if i + 1 < len(marks) else len(w))]
+             for i, (s0, e, name) in enumerate(marks) if name.startswith(which)]
+    return " ".join(parts)
+
+
+_PLAN_DIST_RE = re.compile(
+    r"(?<![\d.@:])(?<![Rr])(\d{2,4})(?:\s*m(?:etres|eters)?)?"
+    r"(?!\s*(?:x|×|\"|”|'|’|%|min|kg|pt|sec|s\b|reps?\b|\d|\.\d|m?\s*(?:start|line|mark|zone|point)))", re.I)
+
+
+def planned_distances(workout: str, key_distance: str = "") -> list:
+    """Rep distances (m) the coach planned for the track part of a session."""
+    out = set()
+    for src in (_workout_section(workout, "TRACK"), str(key_distance or "")):
+        for m in _PLAN_DIST_RE.finditer(src):
+            d = int(m.group(1))
+            if d in _BARE_DISTS and d >= 20:
+                out.add(d)
+    return sorted(out)
+
+
+_CTX_TIME_RE = re.compile(
+    r"(?<![\d.:x×])(\d{1,2}:\d{2}(?:\.\d{1,3})?|\d{1,3}(?:\.\d{1,3})?)"
+    r"(\s*(?:s|secs?|seconds|”|\"))?(?![\d.:]|\s*(?:x|×|m\b|kg|%|min|reps?|sets?|pt|in\b|cm|km|kph|'|’))", re.I)
+
+
+def _bare_times(text: str) -> list:
+    """Every number in a cell that could be a rep time."""
+    text = str(text or "")
+    if not re.search(r"\d\.\d", text):
+        text = re.sub(r"(?<=\d),(?=\d{1,2}(?!\d))", ".", text)
+    decimals = bool(re.search(r"\d\.\d|\d:\d\d", text))
+    out = []
+    for m in _CTX_TIME_RE.finditer(text):
+        raw, unit = m.group(1), m.group(2)
+        before = text[max(0, m.start() - 6):m.start()].lower()
+        if re.search(r"(rpe|r|@\s*\d+%|sets? of)\s*$", before) or (not unit and re.search(r"x\s*$", before)):
+            continue
+        if "." not in raw and ":" not in raw and not unit and decimals:
+            near = text[max(0, m.start() - 1):m.end() + 1]
+            if "/" not in near:
+                continue      # whole numbers only count when no decimals were written, or in "8/8"
+        t = parse_time_text(raw)
+        if t and 1.0 <= t <= 600:
+            summary = bool(re.search(r"(avg|average|mean|total|=)[^\d]{0,12}$", text[:m.start()], re.I))
+            out.append((t, summary))
+    reps = [t for t, summ in out if not summ]
+    return reps or [t for t, summ in out]       # an average on its own still counts
+
+
+def _fit_distance(t: float, dists: list):
+    """The planned distance a time most plausibly belongs to, or None."""
+    best = None
+    for d in dists:
+        ratio = (d / t) / _expected_speed(d)
+        if 0.65 <= ratio <= 1.15:
+            score = abs(np.log(ratio / 0.9))
+            if best is None or score < best[0]:
+                best = (score, d)
+    return best[1] if best else None
+
+
+def track_text_in_context(text: str, workout: str = "", key_distance: str = "") -> str:
+    """
+    Rewrite a track entry as '150m 17.7, 17.3' using the planned session when
+    the athlete didn't write the distance. Returns '' if nothing can be read.
+    """
+    if parse_track_reps(text):
+        return str(text)
+    dists = planned_distances(workout, key_distance)
+    if not dists:
+        return ""
+    by = {}
+    for t in _bare_times(text):
+        d = _fit_distance(t, dists)
+        if d:
+            by.setdefault(d, []).append(t)
+    if not by:
+        return ""
+    return " / ".join(f"{d}m " + ", ".join(fmt_time(t) for t in ts) for d, ts in sorted(by.items()))
+
+
+# ---------- Gym: A1 / B1 codes and weight ladders ----------
+_LABEL_RE = re.compile(r"(?:(?<=^)|(?<=[\s;,/(]))([A-E][1-5])\s*[:.)]?(?=\s|\w|$)", re.M)
+_SXRXL_RE = re.compile(r"(\d{1,2})\s*[x×]\s*(\d{1,2})\s*[x×@]\s*(\d{1,3}(?:\.\d+)?)\s*(kg)?(?![\d.]*\s*%)", re.I)
+_RM_RE = re.compile(r"\b(\d{1,2})\s*RM\b", re.I)
+_LOADNUM_RE = re.compile(r"(?<![\d.(])(\d{2,3}(?:\.\d+)?)\s*(kg)?(?![\d.%x×\"”'’]|\s*(?:%|cm|in\b|reps?|sec|s\b|min))",
+                         re.I)
+
+
+def _split_labels(text: str) -> dict:
+    """{'A1': 'text…', 'B1': '…'} from 'A1: …, B1 …' style text."""
+    text = str(text or "")
+    hits = list(_LABEL_RE.finditer(text))
+    out = {}
+    for i, m in enumerate(hits):
+        stop = hits[i + 1].start() if i + 1 < len(hits) else len(text)
+        out.setdefault(m.group(1).upper(), text[m.end():stop].strip(" :;,.\n"))
+    return out
+
+
+def _first_exercise(text: str):
+    for name, _chunk in _gym_segments(text):
+        return name
+    return False          # no exercise named at all
+
+
+def _plan_reps(text: str):
+    m = re.search(r"\d{1,2}\s*[x×]\s*(\d{1,2})(?!\d)", str(text or ""))
+    return int(m.group(1)) if m else None
+
+
+_LIGHT_LIFTS = {"Split squat", "Step-up", "Weighted chin-up", "Shoulder press"}
+
+
+def _lift_from_chunk(name: str, chunk: str, plan_reps=None, rm_reps=None):
+    """Best (load, reps) a chunk shows for one exercise, using the plan's reps if needed."""
+    if GYM_EVENTS.get(name, "kg") != "kg":
+        return None
+    chunk = re.sub(r"\(\s*(\d)\s*[x×]\s*(\d{1,2}(?:\.\d+)?)\s*kg\s*\)",          # "(2x15kg)" = two dumbbells
+                   lambda m: f"{int(m.group(1)) * float(m.group(2)):g}kg", str(chunk or ""), flags=re.I)
+    lo = 10 if name in _LIGHT_LIFTS else 20
+    if name == "Weighted chin-up":
+        rm_reps = None                                   # "12@11.25" in a 3RM test is reps @ load
+    if re.search(r"\d\s*[/,]\s*\d", chunk) and not re.search(r"kg\s*[x×]\s*\d", chunk, re.I):
+        # ladder: "3x3@ 50/60/70/80", "@ 60, 70, 70"
+        pair = re.search(r"(\d{1,2})\s*[x×]\s*(\d{1,2})(?!\d)(?!\s*[x×]\s*\d)", chunk)
+        reps = rm_reps or (int(pair.group(2)) if pair else plan_reps)
+        loads = [float(m.group(1)) for m in _LOADNUM_RE.finditer(chunk)]
+        loads = [l for l in loads if lo <= l <= 400]
+        if loads and reps and 1 <= reps <= 12:
+            return (max(loads), reps)
+    sets = [(float(m.group(3)), int(m.group(2))) for m in _SXRXL_RE.finditer(chunk)]   # 5x3x60kg
+    if not sets and not rm_reps:
+        sets = [(l, r) for n, l, r in parse_gym_sets(f"{name} {chunk}") if n == name]
+    if not sets:
+        said = re.search(r"(\d{1,2})\s*reps?\b", chunk)
+        reps = int(said.group(1)) if said else (rm_reps or plan_reps)
+        ladder = rm_reps or re.search(r"\d\s*[/,]\s*\d", chunk)
+        loads = [float(m.group(1)) for m in _LOADNUM_RE.finditer(chunk) if ladder or m.group(2)]
+        loads = [l for l in loads if 10 <= l <= 400]
+        if loads and reps and 1 <= reps <= 12:
+            sets = [(max(loads), reps)]
+    sets = [(l, r) for l, r in sets if lo <= l <= 400 and 1 <= r <= 12]
+    if not sets:
+        return None
+    return max(sets, key=lambda lr: epley_1rm(lr[0], lr[1]))
+
+
+def gym_text_in_context(text: str, workout: str = "") -> str:
+    """
+    Rewrite a gym entry as 'Power clean 60kg x 3; Trap bar deadlift 110kg x 5'
+    using the planned session to name A1/B1 codes and fill in missing reps.
+    """
+    text = str(text or "")
+    if not text.strip():
+        return ""
+    plan = _split_labels(_workout_section(workout, "GYM") or workout)
+    mine = _split_labels(text)
+    out = []
+    if mine:
+        for lab, chunk in mine.items():
+            segs = list(_gym_segments(chunk))
+            planned = plan.get(lab, "")
+            if segs:                                   # athlete named the lift ("A1 cleans 5x3x75kg")
+                name = segs[0][0]
+                if len({n for n, _c in segs}) > 1:
+                    chunk = " ".join(c for n, c in segs if n == name)
+            else:
+                name = next((n for n, _c in _gym_segments(planned)), None)
+            if not name:
+                continue                               # not a tracked lift
+            lift = _lift_from_chunk(name, chunk, _plan_reps(chunk) or _plan_reps(planned),
+                                    int(_RM_RE.search(chunk).group(1)) if _RM_RE.search(chunk) else None)
+            if lift:
+                out.append((name, lift))
+    else:
+        rm_all = _RM_RE.search(text)
+        plan_reps = {}
+        for lab, ptxt in plan.items():
+            for n, _c in _gym_segments(ptxt):
+                if n and n not in plan_reps:
+                    plan_reps[n] = _plan_reps(ptxt)
+                break
+        for block in re.split(r"\n\s*\n", text):
+            rm = _RM_RE.search(block) or rm_all
+            for name, chunk in _gym_segments(block):
+                if name:
+                    if rm and not re.search(r"\d", chunk):
+                        chunk = block[block.lower().rfind(chunk.lower()):] if chunk else block
+                    lift = _lift_from_chunk(name, chunk, plan_reps.get(name), int(rm.group(1)) if rm else None)
+                    if lift:
+                        out.append((name, lift))
+    if not out:
+        return ""
+    best = {}
+    for name, (l, r) in out:
+        if name not in best or epley_1rm(l, r) > epley_1rm(*best[name]):
+            best[name] = (l, r)
+    return "; ".join(f"{n} {l:g}kg x {r}" for n, (l, r) in best.items())
+
+
+# ---------- Making every logged rep readable (analysis copy only) ----------
 _EMPTY_TXT = {"", "nan", "none", "nil", "n/a", "na", "-", "—"}
 
 
+@functools.lru_cache(maxsize=20000)
+def _track_ctx_cached(text, workout, key):
+    return track_text_in_context(text, workout, key)
+
+
+@functools.lru_cache(maxsize=20000)
+def _gym_ctx_cached(text, workout):
+    if parse_gym_sets(text) and not _LABEL_RE.search(text) and not _RM_RE.search(text):
+        return text
+    return gym_text_in_context(text, workout) or text
+
+
+@functools.lru_cache(maxsize=20000)
+def _reads_track(text):
+    return bool(parse_track_reps(text))
+
+
+@functools.lru_cache(maxsize=20000)
+def _reads_gym(text):
+    return bool(parse_gym_sets(text))
+
+
+_READABLE_CACHE = {}      # id(df) -> (df, readable copy); load_tab_cached reuses one frame for 60 s
+
+
 def with_reps_from_notes(df: pd.DataFrame) -> pd.DataFrame:
+    """Cached wrapper: the same sheet read is only worked through once."""
+    if df is None or df.empty:
+        return df
+    hit = _READABLE_CACHE.get(id(df))
+    if hit is not None and hit[0] is df:
+        return hit[1].copy()
+    out = _make_reps_readable(df)
+    if len(_READABLE_CACHE) > 16:
+        _READABLE_CACHE.clear()
+    _READABLE_CACHE[id(df)] = (df, out)
+    return out.copy()
+
+
+def _make_reps_readable(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Athletes often type reps or lifts into Athlete_Notes instead of the
-    Track_Reps_Times / Sets_Reps_Load boxes. For charts, PB prompts and
-    comparisons, use the notes as a fallback: if a row's track (or gym) box is
-    empty and its notes contain readable times (or lifts), treat the notes as
-    that box. A box that already has an entry is never changed, so nothing is
-    counted twice. This only changes the copy used for analysis — the sheet
-    itself is never written to.
+    Make every logged rep and lift readable for charts, PB prompts and
+    comparisons (works on a copy — the sheet is never written to):
+      1. Bare times ("17.7 17.3 17.4") get their distance from the planned
+         Workout / Key_Distance, e.g. "150m 17.7, 17.3, 17.4".
+      2. A1/B1 codes and weight ladders ("A1 5x3x60kg", "B1 80/120/120") get
+         the exercise name and reps from the planned Workout.
+      3. If a track or gym box is empty, readable times or lifts in
+         Athlete_Notes are used instead (a filled box is never overridden).
     """
-    if df is None or df.empty or "Athlete_Notes" not in df.columns:
+    if df is None or df.empty:
         return df
     d = df.copy()
     for col in ("Track_Reps_Times", "Sets_Reps_Load"):
         if col not in d.columns:
             d[col] = ""
-    notes = d["Athlete_Notes"].astype(str)
-    has_note = ~notes.str.strip().str.lower().isin(_EMPTY_TXT)
-    for col, reader in (("Track_Reps_Times", parse_track_reps), ("Sets_Reps_Load", parse_gym_sets)):
-        empty = d[col].astype(str).str.strip().str.lower().isin(_EMPTY_TXT)
-        for i in d.index[empty & has_note]:
-            txt = notes.at[i]
-            try:
-                if reader(txt):
-                    d.at[i, col] = txt
-            except Exception:
-                pass
+    wk = d["Workout"].astype(str) if "Workout" in d.columns else pd.Series("", index=d.index)
+    key = d["Key_Distance"].astype(str) if "Key_Distance" in d.columns else pd.Series("", index=d.index)
+    notes = d["Athlete_Notes"].astype(str) if "Athlete_Notes" in d.columns else pd.Series("", index=d.index)
+
+    def _filled(v):
+        return str(v).strip().lower() not in _EMPTY_TXT
+
+    for i in d.index:
+        tr, gy, nt = str(d.at[i, "Track_Reps_Times"]), str(d.at[i, "Sets_Reps_Load"]), notes.at[i]
+        w, k = wk.at[i], key.at[i]
+        try:
+            if _filled(gy):
+                gy2 = _gym_ctx_cached(gy, w)
+                if gy2 != gy:
+                    d.at[i, "Sets_Reps_Load"] = gy2
+                    gy = gy2
+            if _filled(tr) and not _reads_track(tr):
+                tr2 = _track_ctx_cached(tr, w, k)
+                if tr2:
+                    d.at[i, "Track_Reps_Times"] = tr = tr2
+            # Track times typed into the gym box ("150 @ 17.50s")
+            if not _filled(tr) and _filled(gy) and not _reads_gym(gy):
+                tr2 = _track_ctx_cached(gy, w, k)
+                if tr2:
+                    d.at[i, "Track_Reps_Times"] = tr = tr2
+            # Notes as a fallback for empty boxes
+            if _filled(nt):
+                if not _filled(tr) and _reads_track(nt):
+                    d.at[i, "Track_Reps_Times"] = nt
+                if not _filled(gy) and _reads_gym(nt):
+                    d.at[i, "Sets_Reps_Load"] = nt
+        except Exception as e:
+            print(f"⚠️ reading reps (row {i}): {e}")
     return d
 
 
