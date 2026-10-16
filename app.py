@@ -1733,6 +1733,7 @@ def _craft_change(label, today, stats, better, unit="", fmt="{:g}"):
 def craft_reduce(df: pd.DataFrame, day: dt.date, today_vals: dict, track_text: str, gym_text: str,
                  athlete: str) -> dict:
     """R — Retrieval & Reduction. Returns {'meaningful': [...], 'normal': [...], 'flags': [...]}."""
+    df = with_reps_from_notes(df)
     out = {"meaningful": [], "normal": [], "flags": []}
     if df is None or df.empty or "Date" not in df.columns:
         out["flags"].append("No training history yet — feedback is based on today's entry only.")
@@ -3040,6 +3041,7 @@ def pb_context_line(text, athlete: str) -> str:
 
 def latest_track_session(df: pd.DataFrame, today: dt.date, max_age_days: int = 14):
     """(date, text) of the most recent logged track reps, or (None, '')."""
+    df = with_reps_from_notes(df)
     if df is None or df.empty or "Track_Reps_Times" not in df.columns:
         return None, ""
     d = df.copy()
@@ -3056,6 +3058,7 @@ def latest_track_session(df: pd.DataFrame, today: dt.date, max_age_days: int = 1
 
 def last_rep_by_event(df: pd.DataFrame, today: dt.date, pbs: dict, max_age_days: int = 21) -> dict:
     """{event: {best, pct, date}} from the most recent session that included each event."""
+    df = with_reps_from_notes(df)
     out = {}
     if df is None or df.empty or "Track_Reps_Times" not in df.columns:
         return out
@@ -3208,6 +3211,41 @@ def gym_context_line(text, athlete: str) -> str:
     return "; ".join(parts)
 
 
+
+# ---------- Reps written in Athlete_Notes ----------
+_EMPTY_TXT = {"", "nan", "none", "nil", "n/a", "na", "-", "—"}
+
+
+def with_reps_from_notes(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Athletes often type reps or lifts into Athlete_Notes instead of the
+    Track_Reps_Times / Sets_Reps_Load boxes. For charts, PB prompts and
+    comparisons, use the notes as a fallback: if a row's track (or gym) box is
+    empty and its notes contain readable times (or lifts), treat the notes as
+    that box. A box that already has an entry is never changed, so nothing is
+    counted twice. This only changes the copy used for analysis — the sheet
+    itself is never written to.
+    """
+    if df is None or df.empty or "Athlete_Notes" not in df.columns:
+        return df
+    d = df.copy()
+    for col in ("Track_Reps_Times", "Sets_Reps_Load"):
+        if col not in d.columns:
+            d[col] = ""
+    notes = d["Athlete_Notes"].astype(str)
+    has_note = ~notes.str.strip().str.lower().isin(_EMPTY_TXT)
+    for col, reader in (("Track_Reps_Times", parse_track_reps), ("Sets_Reps_Load", parse_gym_sets)):
+        empty = d[col].astype(str).str.strip().str.lower().isin(_EMPTY_TXT)
+        for i in d.index[empty & has_note]:
+            txt = notes.at[i]
+            try:
+                if reader(txt):
+                    d.at[i, col] = txt
+            except Exception:
+                pass
+    return d
+
+
 def _recent_rows(df, today, col, max_age_days):
     if df is None or df.empty or col not in df.columns:
         return pd.DataFrame()
@@ -3220,6 +3258,7 @@ def _recent_rows(df, today, col, max_age_days):
 
 
 def last_lift_by_exercise(df, today, pbs, max_age_days: int = 28) -> dict:
+    df = with_reps_from_notes(df)
     out = {}
     for _, r in _recent_rows(df, today, "Sets_Reps_Load", max_age_days).iterrows():
         for row in summarise_gym_vs_pb(r.get("Sets_Reps_Load", ""), pbs):
@@ -3231,6 +3270,7 @@ def last_lift_by_exercise(df, today, pbs, max_age_days: int = 28) -> dict:
 
 def gym_session_history(df, athlete) -> dict:
     """{exercise: [{date, est, load, reps}]} — top set per session, oldest first."""
+    df = with_reps_from_notes(df)
     out = {}
     pbs = current_pbs(athlete)
     for _, r in _recent_rows(df, today_adl(), "Sets_Reps_Load", 3650).iloc[::-1].iterrows():
@@ -3274,6 +3314,7 @@ def ai_normalise_gym_text(text: str, workout: str = "") -> str:
 
 def pb_proposals(df: pd.DataFrame, athlete: str, today: dt.date, dismissed=None) -> list:
     """Reps/lifts from the last 7 days that beat (or set) a PB — for one-tap confirm."""
+    df = with_reps_from_notes(df)
     dismissed = set(dismissed or [])
     pbs = current_pbs(athlete)
     props = []
@@ -7167,6 +7208,7 @@ def pb_value_on(athlete: str, event: str, day: dt.date):
 
 def sprint_quality_history(df: pd.DataFrame, athlete: str) -> dict:
     """{event: [{date, best, avg, n, pb, best_pct, avg_pct}]} oldest first."""
+    df = with_reps_from_notes(df)
     out = {}
     if df is None or df.empty or "Track_Reps_Times" not in df.columns:
         return out
