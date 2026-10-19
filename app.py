@@ -1502,7 +1502,7 @@ def persona_prompt(mode: str) -> str:
 # ============================================================
 #  AGENTIC STEP 1 — keyword-based persona pre-selection
 #  Used only when a coach hasn't manually picked one of the two
-#  ADPTV insight personas: scans the athlete's own logged text
+#  ADPTVV insight personas: scans the athlete's own logged text
 #  (notes, gym/track work, 7-day wellness scan) and picks the
 #  persona whose keywords match most strongly, instead of always
 #  falling back to a fixed default.
@@ -4556,7 +4556,7 @@ app.index_string = """
         <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css">
         <link rel="icon" type="image/png" sizes="192x192" href="/assets/icon-192.png">
         <link rel="apple-touch-icon" href="/assets/icon-192.png">
-        <title>ADPTV</title>
+        <title>ADPTVV</title>
         <style>
           .coach-radio {
             display: flex;
@@ -4942,7 +4942,7 @@ def app_header(center=False):
                      style={"height": "50px", "marginRight": "12px", "flexShrink": "0"}),
             html.Div(
                 [
-                    html.H3("ADPTV",
+                    html.H3("ADPTVV",
                             style={"margin": 0, "fontWeight": 600, "lineHeight": "1.1"}),
                     html.Small("Powered by AdaptivIQ",
                                style={"color": "var(--text-muted)", "display": "block", "lineHeight": "1.3"}),
@@ -5161,7 +5161,7 @@ def build_main_layout(auth_data):
             ]),
             html.Hr(),
             html.H4("Selected Session & Athlete Input", className="mt-3 mb-1"),
-            html.P("Log your session data and generate ADPTV insights",
+            html.P("Log your session data and generate ADPTVV insights",
                    style={"color": "var(--text-muted)", "fontSize": "13px", "margin": "0 0 12px 0"}),
             html.Div(
                 id="session-input-container",
@@ -5259,7 +5259,7 @@ def build_main_layout(auth_data):
                         ], md=6),
                         dbc.Col([
                             html.Div([
-                                dbc.Label("Primary ADPTV insight (select one)"),
+                                dbc.Label("Primary ADPTVV insight (select one)"),
                                 dcc.RadioItems(
                                     id="ai-mode-1",
                                     options=[
@@ -5274,7 +5274,7 @@ def build_main_layout(auth_data):
                                 ),
                             ], style={"marginBottom": "16px"}),
                             html.Div([
-                                dbc.Label("Secondary ADPTV insight (select one)"),
+                                dbc.Label("Secondary ADPTVV insight (select one)"),
                                 dcc.RadioItems(
                                     id="ai-mode-2",
                                     options=[
@@ -5288,7 +5288,7 @@ def build_main_layout(auth_data):
                                     inputClassName="coach-radio-input", labelClassName="coach-radio-label",
                                 ),
                             ], style={"marginBottom": "4px"}),
-                            dbc.Button("Log Session & Generate ADPTV insights",
+                            dbc.Button("Log Session & Generate ADPTVV insights",
                                        id="btn-generate-ai", className="mt-4 w-100 ai-save-btn"),
                             html.Div(id="save-status", className="mt-2"),
                             dcc.Loading(id="ai-loader", type="circle", children=[
@@ -5619,7 +5619,7 @@ app.layout = html.Div([
         id="splash-screen",
         children=[
             html.Img(src="/assets/app_icon.png", className="splash-logo"),
-            html.H2("ADPTV", className="splash-title"),
+            html.H2("ADPTVV", className="splash-title"),
             html.P("Powered by AdaptivIQ", className="splash-subtitle"),
             html.Div(className="spinner"),
         ]
@@ -6316,7 +6316,7 @@ def on_day_click(n_clicks_list, close_n, edit_n, athlete_name):
 
     if ai1 != "—":
         body.append(html.Div([
-            html.Span("PRIMARY ADPTV INSIGHTS", style={
+            html.Span("PRIMARY ADPTVV INSIGHTS", style={
                 "fontSize": "11px", "fontWeight": "600", "color": "#999",
                 "textTransform": "uppercase", "letterSpacing": "0.05em"}),
             html.Span(f" · {mode_1_label}", style={
@@ -6331,7 +6331,7 @@ def on_day_click(n_clicks_list, close_n, edit_n, athlete_name):
 
     if ai2 != "—":
         body.append(html.Div([
-            html.Span("SECONDARY ADPTV INSIGHTS", style={
+            html.Span("SECONDARY ADPTVV INSIGHTS", style={
                 "fontSize": "11px", "fontWeight": "600", "color": "#999",
                 "textTransform": "uppercase", "letterSpacing": "0.05em"}),
             html.Span(f" · {mode_2_label}", style={
@@ -6654,7 +6654,7 @@ def save_and_ai(
     focus_val = safe(df, row_idx, "Focus", "")
     venue_val = safe(df, row_idx, "Venue", "")
     workout_val = safe(df, row_idx, "Workout", "")
-    status_msg = "✅ Saved, ADPTV insights generated & email sent to Coach."
+    status_msg = "✅ Saved, ADPTVV insights generated & email sent to Coach."
 
     coach3_email = safe(df, row_idx, "Coach_email3") if "Coach_email3" in df.columns else ""
     try:
@@ -6670,11 +6670,11 @@ def save_and_ai(
             "AI_Mode_1": ai_mode_1, "AI_Mode_2": ai_mode_2,
         })
     except Exception as e:
-        status_msg = f"⚠️ Saved + ADPTV insights generated, but email failed: {e}"
+        status_msg = f"⚠️ Saved + ADPTVV insights generated, but email failed: {e}"
 
     ai1_div = html.Div(html.Div([
         html.Div([
-            html.Span("ADPTV Insight 1", className="ai-title",
+            html.Span("ADPTVV Insight 1", className="ai-title",
                       style={"display": "inline", "verticalAlign": "middle"}),
             html.Span(f" · {ai_mode_1.replace(' Coach', '')}", style={
                 "fontSize": "11px", "color": "#2E7D32", "fontWeight": "600",
@@ -6688,7 +6688,7 @@ def save_and_ai(
 
     ai2_div = html.Div(html.Div([
         html.Div([
-            html.Span("ADPTV Insight 2", className="ai-title",
+            html.Span("ADPTVV Insight 2", className="ai-title",
                       style={"display": "inline", "verticalAlign": "middle"}),
             html.Span(f" · {ai_mode_2.replace(' Coach', '')}", style={
                 "fontSize": "11px", "color": "#1565C0", "fontWeight": "600",
@@ -7183,7 +7183,7 @@ body{{background:#111;font-family:system-ui,sans-serif;display:flex;flex-directi
 </style></head><body>
 <div id="picker"></div>
 <div id="preview"><canvas id="bg"></canvas><div id="scrim"></div>
-  <div class="brand">{"<img src='data:image/png;base64," + logo_b64 + "'/>" if logo_b64 else ""}ADPTV</div>
+  <div class="brand">{"<img src='data:image/png;base64," + logo_b64 + "'/>" if logo_b64 else ""}ADPTVV</div>
   <div id="ov"><div id="chip" class="chip">NEW PB</div><div class="ev" id="ev"></div>
   <div class="val" id="val"></div><div class="sub" id="sub"></div><div class="delta" id="delta"></div>
   <div class="name">{first}</div><div class="date" id="date"></div></div></div>
@@ -7225,9 +7225,9 @@ document.getElementById('dlBtn').addEventListener('click',function(){{
   x.textAlign='center';x.textBaseline='alphabetic';
   if(logo&&logo.naturalWidth){{const oc=document.createElement('canvas');oc.width=48;oc.height=48;const q=oc.getContext('2d');
     q.drawImage(logo,0,0,48,48);q.globalCompositeOperation='source-in';q.fillStyle='rgba(255,255,255,.9)';q.fillRect(0,0,48,48);
-    x.font='500 28px system-ui';const tw=x.measureText('ADPTV').width;const bx=W/2-(60+tw)/2;x.drawImage(oc,bx,70,48,48);
-    x.textAlign='left';x.fillStyle='rgba(255,255,255,.75)';x.fillText('ADPTV',bx+60,104);x.textAlign='center';}}
-  else{{x.font='500 28px system-ui';x.fillStyle='rgba(255,255,255,.75)';x.fillText('ADPTV',W/2,104);}}
+    x.font='500 28px system-ui';const tw=x.measureText('ADPTVV').width;const bx=W/2-(60+tw)/2;x.drawImage(oc,bx,70,48,48);
+    x.textAlign='left';x.fillStyle='rgba(255,255,255,.75)';x.fillText('ADPTVV',bx+60,104);x.textAlign='center';}}
+  else{{x.font='500 28px system-ui';x.fillStyle='rgba(255,255,255,.75)';x.fillText('ADPTVV',W/2,104);}}
   let y=H*0.60;const chip=it.new?'NEW PB':'PERSONAL BEST';x.font='800 30px system-ui';const cw=x.measureText(chip).width+60;
   x.fillStyle=it.new?'#2fb344':'rgba(255,255,255,.16)';x.beginPath();
   if(x.roundRect)x.roundRect(W/2-cw/2,y-46,cw,64,32);else x.rect(W/2-cw/2,y-46,cw,64);x.fill();
@@ -8387,7 +8387,7 @@ body{{background:#111;font-family:system-ui,sans-serif;display:flex;flex-directi
       <div class="topbar">
         <span class="brand">
           {"<img src='data:image/png;base64," + logo_b64 + "' alt='ACI' style='width:18px;height:18px;object-fit:contain;filter:brightness(0) invert(1);opacity:0.85'/>" if logo_b64 else ""}
-          ADPTV
+          ADPTVV
         </span>
       </div>
       <div class="hero-dial">
@@ -8640,15 +8640,15 @@ body{{background:#111;font-family:system-ui,sans-serif;display:flex;flex-directi
       octx.globalCompositeOperation='source-in';
       octx.fillStyle='rgba(255,255,255,0.90)';octx.fillRect(0,0,LOGO_SIZE,LOGO_SIZE);
       ctx.font='500 26px system-ui';
-      const tw=ctx.measureText('ADPTV').width;
+      const tw=ctx.measureText('ADPTVV').width;
       const bx=CX-(LOGO_SIZE+12+tw)/2;
       ctx.drawImage(oc,bx,BRAND_Y,LOGO_SIZE,LOGO_SIZE);
       ctx.fillStyle='rgba(255,255,255,0.70)';ctx.textAlign='left';ctx.textBaseline='middle';
-      ctx.fillText('ADPTV',bx+LOGO_SIZE+12,BRAND_Y+LOGO_SIZE/2);
+      ctx.fillText('ADPTVV',bx+LOGO_SIZE+12,BRAND_Y+LOGO_SIZE/2);
     }}else{{
       ctx.font='500 26px system-ui';ctx.fillStyle='rgba(255,255,255,0.70)';
       ctx.textAlign='center';ctx.textBaseline='middle';
-      ctx.fillText('ADPTV',CX,BRAND_Y+LOGO_SIZE/2);
+      ctx.fillText('ADPTVV',CX,BRAND_Y+LOGO_SIZE/2);
     }}
 
     // ── Hero readiness, then the three supporting scores ─────────────────────
@@ -9160,7 +9160,7 @@ def update_garmin_badge(athlete_id, _today):
         ], style={"textAlign": "center", "marginTop": "4px"})
     else:
         badge = html.Div([
-            html.A("ADPTV Connect", href=f"/garmin/connect?athlete={athlete_id}", target="_blank",
+            html.A("ADPTVV Connect", href=f"/garmin/connect?athlete={athlete_id}", target="_blank",
                    style={"fontSize": "11px", "color": "#1565C0", "textDecoration": "none",
                           "background": "#e3f2fd", "padding": "3px 10px", "borderRadius": "20px",
                           "border": "1px solid #90caf9", "fontWeight": "500"}),
