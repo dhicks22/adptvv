@@ -13,6 +13,8 @@ import os
 import re
 import json
 import time
+import hmac
+import hashlib
 import functools
 import datetime as dt
 from zoneinfo import ZoneInfo
@@ -2615,7 +2617,7 @@ def garmin_enrich_df_row(df: pd.DataFrame, date: dt.date) -> dict:
 #  to ensure both always show the same value
 # ============================================================
 
-def compute_neuro_for_athlete(df: pd.DataFrame, today: dt.date) -> float | None:
+def compute_neuro_for_athlete(df: pd.DataFrame, today: dt.date, athlete: str | None = None) -> float | None:
     """
     Neuromuscular readiness from the most recent wellness data. Shared by the
     dashboard, welcome message and share card so they always agree.
@@ -2655,7 +2657,18 @@ def compute_neuro_for_athlete(df: pd.DataFrame, today: dt.date) -> float | None:
     sleep_last, fatigue_last, soreness_last, mood_last = vals
     neuro_val = calc_neuro_readiness(sleep_last, fatigue_last, soreness_last, mood_last,
                                      history_df=recent, span=3)
-    return None if neuro_val is None else float(np.clip(neuro_val, 0, 100))
+    if neuro_val is None:
+        return None
+    neuro_val = float(np.clip(neuro_val, 0, 100))
+    if athlete:
+        # Today's Eye Check (once the athlete has a baseline) nudges the score:
+        # at most 10 points down, 5 up. See eye_neuro_adjustment().
+        try:
+            adj, _res = eye_neuro_adjustment(athlete, today)
+            neuro_val = float(np.clip(neuro_val + adj, 0, 100))
+        except Exception as e:
+            print(f"⚠️ Eye Check neuro blend failed for {athlete}: {e}")
+    return neuro_val
 
 
 def days_since_last_data(df: pd.DataFrame, today: dt.date) -> int | None:
@@ -3787,7 +3800,7 @@ def _latest_and_usual(d, col, lookback):
     return latest, usual
 
 
-def compute_drivers(df: pd.DataFrame, today: dt.date, lookback: int = 28) -> list:
+def compute_drivers(df: pd.DataFrame, today: dt.date, lookback: int = 28, athlete: str | None = None) -> list:
     """
     What is pushing readiness up or down, each marker against the athlete's
     OWN recent average rather than a fixed scale.
@@ -3855,6 +3868,13 @@ def compute_drivers(df: pd.DataFrame, today: dt.date, lookback: int = 28) -> lis
             "kind": "load",
             "delta": 0.0 if 0.8 <= v <= 1.3 else min(abs(v - 1.3), abs(v - 0.8)) * 3,
         })
+    if athlete:
+        try:
+            row = eye_driver_row(athlete, today)
+            if row:
+                out.append(row)
+        except Exception as e:
+            print(f"⚠️ Eye Check driver failed for {athlete}: {e}")
     return out
 
 
@@ -3871,7 +3891,7 @@ _REASON_PHRASES = {
 }
 
 
-def verdict_reason(df, today, readiness, neuro, stale: bool = False) -> str:
+def verdict_reason(df, today, readiness, neuro, stale: bool = False, athlete: str | None = None) -> str:
     """
     One short line under the verdict naming today's main reason, so it changes
     day to day even when the verdict band doesn't. Uses the same comparison as
@@ -3880,7 +3900,7 @@ def verdict_reason(df, today, readiness, neuro, stale: bool = False) -> str:
     if stale:
         return freshness_label(days_since_last_data(df, today)) + " — check in to update"
     try:
-        drivers = compute_drivers(df, today)
+        drivers = compute_drivers(df, today, athlete=athlete)
     except Exception:
         drivers = []
     both = [v for v in [readiness, neuro] if v is not None]
@@ -5068,6 +5088,7 @@ def build_main_layout(auth_data):
             html.Div(id="welcome-message", className="mt-3"),
             html.Div(id="badges-row", className="mt-2"),
             html.Div(id="checkin-card", className="mt-3"),
+            html.Div(id="eyecheck-card", className="mt-3"),
             html.Div(id="today-session-card", className="mt-3"),
             html.Div(pb_card_layout(), className="mt-3"),
             html.Div(id="motivational-message", style={"display": "none"}),
@@ -6041,7 +6062,7 @@ def update_dashboard(athlete_id, view_mode, n_clicks, theme):
     data_source = today_enriched["source"]
 
     # Use shared helper — guarantees same result as share card
-    neuro_val = compute_neuro_for_athlete(df, today)
+    neuro_val = compute_neuro_for_athlete(df, today, athlete_id)
 
     df_time = df.copy()
     df_time["Date"] = pd.to_datetime(df_time["Date"], errors="coerce")
@@ -6106,7 +6127,7 @@ def update_dashboard(athlete_id, view_mode, n_clicks, theme):
 
     verdict_txt, verdict_col = readiness_verdict(readiness_val, neuro_val, is_stale)
     try:
-        reason = verdict_reason(df, today, readiness_val, neuro_val, is_stale)
+        reason = verdict_reason(df, today, readiness_val, neuro_val, is_stale, athlete=athlete_id)
     except Exception:
         reason = ""
     reason = (reason[:1].upper() + reason[1:]) if reason else ""
@@ -8059,7 +8080,7 @@ def _build_welcome(athlete_id):
         if df is not None and not df.empty:
             streak, _ = compute_streaks(df)
             readiness_val = compute_readiness_for_athlete(df, today)
-            neuro_val = compute_neuro_for_athlete(df, today)
+            neuro_val = compute_neuro_for_athlete(df, today, athlete_id)
             stale_days = days_since_last_data(df, today)
     except Exception as e:
         print(f"⚠️ welcome data error for {athlete_id}: {e}")
@@ -8067,7 +8088,7 @@ def _build_welcome(athlete_id):
     is_stale = stale_days is None or stale_days >= STALE_DAYS
     verdict, _ = readiness_verdict(readiness_val, neuro_val, is_stale)
     try:
-        reason = verdict_reason(df, today, readiness_val, neuro_val, is_stale) if not df.empty else ""
+        reason = verdict_reason(df, today, readiness_val, neuro_val, is_stale, athlete=athlete_id) if not df.empty else ""
     except Exception:
         reason = ""
     try:
@@ -8088,7 +8109,7 @@ def _build_welcome(athlete_id):
         pass
 
     try:
-        drivers = compute_drivers(df, today) if not df.empty else []
+        drivers = compute_drivers(df, today, athlete=athlete_id) if not df.empty else []
     except Exception:
         drivers = []
 
@@ -8237,7 +8258,7 @@ def show_share_card(n, close_n, athlete_id, current_style):
             readiness_val = calc_daily_readiness(load_series, rpe_series, quality_series) or 0
 
             # Use shared helper — same result as main dashboard
-            neuro_val = compute_neuro_for_athlete(df, today) or 0
+            neuro_val = compute_neuro_for_athlete(df, today, athlete_id) or 0
 
             # Still grab wellness values for display
             _df_n = df.copy()
@@ -9003,7 +9024,7 @@ def update_today_session(athlete_id, _today, _saved):
     is_stale = stale_days is None or stale_days >= STALE_DAYS
 
     readiness = compute_readiness_for_athlete(df, today)
-    neuro = compute_neuro_for_athlete(df, today)
+    neuro = compute_neuro_for_athlete(df, today, athlete_id)
 
     # Use the SAME combined score as the hero verdict, so the card can never
     # say "Go as planned" while the headline says "Train with care".
@@ -9073,7 +9094,7 @@ def update_drivers_panel(n_clicks, athlete_id, _saved):
         df = load_tab_cached(athlete_id)
     except Exception:
         return None
-    drivers = compute_drivers(df, today)
+    drivers = compute_drivers(df, today, athlete=athlete_id)
     if not drivers:
         return html.Div("Not enough data yet to break the score down.",
                         className="drivers-empty")
@@ -9579,7 +9600,7 @@ def update_squad_view(nav_clicks, refresh_clicks, auth_data, theme):
                     rpe_s = pd.Series(dtype=float, index=dft.index)
                 qual_s = pd.to_numeric(dft.get("Session_1_5"), errors="coerce")
                 readiness_val = calc_daily_readiness(load_s, rpe_s, qual_s)
-                neuro_val = compute_neuro_for_athlete(df, today)
+                neuro_val = compute_neuro_for_athlete(df, today, sheet_name)
 
                 df2 = df.copy()
                 df2["Date"] = pd.to_datetime(df2["Date"], errors="coerce").dt.date
@@ -9953,6 +9974,885 @@ app.clientside_callback(
     Output("pb-chevron", "children"),
     Input("pb-collapsed", "data"),
 )
+
+
+
+# ============================================================
+#  EYE CHECK — optical fatigue test on the iPhone's front camera
+#  1) Blinks (30 s): blink rate, blink duration, PERCLOS
+#  2) Pupil response (~14 s): screen flashes white, pupil constriction %
+#  3) Reaction test (30 s): brief PVT — median reaction time + lapses
+#  Everything runs on the phone; only the numbers reach the server.
+#  Results go to a shared "EyeChecks" tab and are judged against the
+#  athlete's OWN recent baseline (needs 5 checks before it says anything).
+# ============================================================
+
+EYE_TAB = "EyeChecks"
+EYE_HEADERS = ["Athlete", "Date", "Logged_At", "Blink_Rate", "Blink_Dur_ms", "PERCLOS",
+               "Pupil_Constrict", "PVT_Median_ms", "PVT_Lapses", "PVT_False_Starts", "Quality",
+               # 3-minute reaction test (Basner 2011 PVT-B, lapses counted from 355 ms).
+               # Kept separate from the old 30 s columns so the two never mix in a baseline.
+               "PVT3_Median_ms", "PVT3_Lapses", "PVT3_Trials"]
+EYE_MIN_BASELINE = 5
+EYE_BASELINE_N = 14
+
+# key in JSON, sheet column, label, unit, +1 = higher is worse, smallest meaningful SD, valid range
+EYE_METRICS = [
+    ("blink_rate", "Blink_Rate", "Blink rate", "/min", +1, 2.0, (0, 120)),
+    ("blink_dur", "Blink_Dur_ms", "Blink duration", " ms", +1, 15.0, (20, 1000)),
+    ("perclos", "PERCLOS", "Eyes closed (PERCLOS)", "%", +1, 1.0, (0, 100)),
+    ("pupil", "Pupil_Constrict", "Pupil response", "%", -1, 3.0, (-20, 80)),
+    ("pvt_median", "PVT3_Median_ms", "Reaction time", " ms", +1, 15.0, (100, 1500)),
+    ("pvt_lapses", "PVT3_Lapses", "Slow reactions (>355 ms)", "", +1, 1.0, (0, 200)),
+]
+
+_EYE_SECRET = os.getenv("EYECHECK_SECRET") or hashlib.sha256(
+    ((os.getenv("GS_SERVICE_JSON") or "") + "|adptv-eyecheck").encode()).hexdigest()
+_eye_cache = {}
+
+
+def eyecheck_token(athlete: str, day: dt.date) -> str:
+    return hmac.new(_EYE_SECRET.encode(), f"{athlete}|{day}".encode(), "sha256").hexdigest()[:32]
+
+
+def eyecheck_token_ok(athlete: str, token: str) -> bool:
+    """Links are valid on the day they're issued and the day after (covers midnight)."""
+    if not athlete or not token:
+        return False
+    today = today_adl()
+    return any(hmac.compare_digest(str(token), eyecheck_token(athlete, today - dt.timedelta(days=k)))
+               for k in (0, 1))
+
+
+def _eye_athletes() -> set:
+    """
+    Athletes who get the Eye Check. By default every athlete does. To offer it to
+    only some, set EYECHECK_ATHLETES on Render to their sheet names, comma-separated,
+    e.g.  Harrison Hunt, Cailen Hejka   (set it to  none  to switch it off for everyone).
+    """
+    everyone = {info.get("sheet", "") for _, info in USER_LOGINS.items()
+                if info.get("sheet", "") and info.get("role", "athlete") == "athlete"}
+    chosen = os.getenv("EYECHECK_ATHLETES", "").strip()
+    if not chosen or chosen.lower() == "all":
+        return everyone
+    if chosen.lower() == "none":
+        return set()
+    wanted = {n.strip().lower() for n in chosen.split(",") if n.strip()}
+    return {a for a in everyone if a.strip().lower() in wanted}
+
+
+def _eye_ws(create: bool = False):
+    if sh is None:
+        return None
+    try:
+        ws = sh.worksheet(EYE_TAB)
+    except gspread.WorksheetNotFound:
+        if not create:
+            return None
+        ws = sh.add_worksheet(title=EYE_TAB, rows=1000, cols=len(EYE_HEADERS))
+        ws.append_row(EYE_HEADERS, value_input_option="USER_ENTERED")
+        return ws
+    if create:
+        # A tab made by an earlier version lacks the newer headings — add them on the end.
+        try:
+            head = ws.row_values(1)
+            if len(head) < len(EYE_HEADERS) and head == EYE_HEADERS[:len(head)]:
+                if ws.col_count < len(EYE_HEADERS):
+                    ws.add_cols(len(EYE_HEADERS) - ws.col_count)
+                ws.update(values=[EYE_HEADERS], range_name="A1")
+        except Exception as e:
+            print(f"⚠️ Eye Check header check: {e}")
+    return ws
+
+
+def _load_eye_tab() -> pd.DataFrame:
+    """The whole EyeChecks tab, read at most once a minute and shared by every athlete."""
+    now = time.time()
+    hit = _eye_cache.get("__all__")
+    if hit and now - hit[0] < 60:
+        return hit[1]
+    all_df = pd.DataFrame(columns=EYE_HEADERS)
+    try:
+        ws = _eye_ws()
+        if ws is not None:
+            vals = ws.get_all_values()
+            if vals and len(vals) > 1:
+                head = vals[0]
+                rows = [(r + [""] * len(head))[:len(head)] for r in vals[1:]]
+                all_df = pd.DataFrame(rows, columns=head)
+    except Exception as e:
+        print(f"⚠️ Eye Check load failed: {e}")
+    _eye_cache["__all__"] = (now, all_df)
+    return all_df
+
+
+def load_eye_rows(athlete: str) -> pd.DataFrame:
+    """All Eye Check rows for one athlete, oldest first."""
+    all_df = _load_eye_tab()
+    if all_df.empty or "Athlete" not in all_df.columns:
+        return pd.DataFrame(columns=EYE_HEADERS)
+    return all_df[all_df["Athlete"].str.strip() == athlete.strip()].reset_index(drop=True)
+
+
+def _eye_num(v):
+    try:
+        f = float(v)
+        return None if np.isnan(f) else f
+    except (TypeError, ValueError):
+        return None
+
+
+def eyecheck_assess(current: dict, history: pd.DataFrame) -> dict:
+    """
+    Compare one result with the athlete's previous checks (not today's).
+    current: {sheet column: value}. Returns verdict, tone and one line per metric.
+    """
+    prior = history.copy() if history is not None else pd.DataFrame()
+    n_prior = len(prior)
+    lines, zs = [], []
+    for key, col, label, unit, worse, floor, _rng in EYE_METRICS:
+        v = _eye_num(current.get(col))
+        if v is None:
+            continue
+        line = {"label": label, "value": f"{v:.0f}{unit}" if col != "PERCLOS" else f"{v:.1f}{unit}",
+                "usual": "", "flag": "normal"}
+        if n_prior and col in prior.columns:
+            h = pd.to_numeric(prior[col], errors="coerce").dropna().tail(EYE_BASELINE_N)
+            if len(h) >= EYE_MIN_BASELINE:
+                mean = float(h.mean())
+                sd = max(float(h.std(ddof=1)) if len(h) > 1 else 0.0, floor)
+                z = (v - mean) / sd * worse
+                zs.append(z)
+                line["usual"] = f"usual {mean:.0f}{unit}" if col != "PERCLOS" else f"usual {mean:.1f}{unit}"
+                line["flag"] = "worse" if z >= 1 else ("better" if z <= -1 else "normal")
+        lines.append(line)
+
+    if not lines:
+        return {"verdict": "No usable results", "tone": "normal", "lines": [], "baseline_n": n_prior,
+                "sub": "Try again in better light, holding the phone steady.",
+                "action": "Train as planned today, using your check-in and how you feel."}
+    if not zs:
+        n = min(n_prior + 1, EYE_MIN_BASELINE)   # this check counts too
+        return {"verdict": "Building your baseline", "tone": "normal", "lines": lines, "baseline_n": n_prior,
+                "sub": f"{n} of {EYE_MIN_BASELINE} checks done. Results are compared with your own "
+                       f"normal once you have {EYE_MIN_BASELINE}.",
+                "action": "Train as planned. Do the check at the same time each day, ideally before "
+                          "training, so your baseline is reliable."}
+    idx = float(np.mean(zs))
+    worst = max(zs)
+    if idx >= 1.2 or worst >= 2.5:
+        verdict, tone, sub = "Well off your usual", "bad", "Signs of fatigue against your own normal."
+        action = ("Make today a lighter day and check in with your coach before any fast or heavy work. "
+                  "Prioritise food, fluids and an early night.")
+    elif idx >= 0.5 or worst >= 1.5:
+        verdict, tone, sub = "Slightly off your usual", "watch", "Some markers are below your normal today."
+        action = ("Train, but keep quality high and trim the volume — stop the reps once speed or "
+                  "technique drops off.")
+    else:
+        verdict, tone, sub = "In your normal range", "good", "Nothing stands out against your usual."
+        action = "Train as planned."
+    return {"verdict": verdict, "tone": tone, "lines": lines, "baseline_n": n_prior, "sub": sub,
+            "action": action, "index": round(idx, 2)}
+
+
+def _eye_split_today(rows: pd.DataFrame, today: dt.date):
+    """(today's latest row as dict or None, rows from before today)."""
+    if rows is None or rows.empty:
+        return None, pd.DataFrame(columns=EYE_HEADERS)
+    d = rows.copy()
+    d["_d"] = pd.to_datetime(d["Date"], errors="coerce").dt.date
+    before = d[d["_d"] < today]
+    todays = d[d["_d"] == today]
+    latest = todays.iloc[-1].to_dict() if not todays.empty else None
+    return latest, before
+
+
+# How far today's Eye Check can move the Neuromuscular dial. Kept small on purpose:
+# most of the evidence for these tests comes from sleep deprivation, not training fatigue.
+EYE_NEURO_PER_INDEX = 6.0     # points per unit of the fatigue index (mean z vs own baseline)
+EYE_NEURO_MAX_DOWN = 10.0
+EYE_NEURO_MAX_UP = 5.0
+
+
+def eye_today(athlete: str, today: dt.date):
+    """Today's assessed Eye Check for an athlete, or None."""
+    if athlete not in _eye_athletes():
+        return None              # Eye Check switched off for this athlete: no effect on the dials
+    latest, before = _eye_split_today(load_eye_rows(athlete), today)
+    return eyecheck_assess(latest, before) if latest is not None else None
+
+
+def eye_neuro_adjustment(athlete: str, today: dt.date):
+    """(points to add to Neuromuscular, assessment). Zero until a baseline exists."""
+    res = eye_today(athlete, today)
+    if not res or res.get("index") is None:
+        return 0.0, res
+    adj = -EYE_NEURO_PER_INDEX * float(res["index"])
+    return float(np.clip(adj, -EYE_NEURO_MAX_DOWN, EYE_NEURO_MAX_UP)), res
+
+
+def eye_driver_row(athlete: str, today: dt.date):
+    """A row for the 'See what's driving it' panel, or None if there's nothing to judge yet."""
+    adj, res = eye_neuro_adjustment(athlete, today)
+    if not res or res.get("index") is None:
+        return None
+    idx = float(res["index"])
+    if idx >= 0.5:
+        status, tone = "Below your usual", "watch"
+    elif idx <= -0.5:
+        status, tone = "Sharper than usual", "good"
+    else:
+        status, tone = "Normal", "normal"
+    off = [f"{ln['label'].lower()} {ln['value']}" for ln in res["lines"] if ln["flag"] == "worse"][:2]
+    detail = f"Today's check · {adj:+.0f} on Neuromuscular" + (f" · {', '.join(off)}" if off else "")
+    return {"label": "Eye check", "detail": detail,
+            "pct": float(np.clip(50 - idx * 20, 0, 100)), "usual_pct": 50.0,
+            "status": status, "tone": tone, "kind": "scale", "delta": abs(idx) * 0.7}
+
+
+@server.route("/eyecheck")
+def eyecheck_page():
+    athlete = flask_request.args.get("athlete", "")
+    token = flask_request.args.get("t", "")
+    if athlete not in _eye_athletes() or not eyecheck_token_ok(athlete, token):
+        return ("<html><body style='font-family:system-ui;background:#0d1117;color:#e6ebf1;padding:40px'>"
+                "<h3>This Eye Check link has expired</h3><p>Open Eye Check again from the ADPTVV Home screen.</p>"
+                "<p><a href='/' style='color:#4dabf7'>Back to ADPTVV</a></p></body></html>"), 403
+    first = athlete.strip().split()[0] if athlete.strip() else "Athlete"
+    page = (EYECHECK_HTML.replace("__ATHLETE__", json.dumps(athlete))
+            .replace("__TOKEN__", json.dumps(token))
+            .replace("__FIRST__", html_escape(first)))
+    return page, 200, {"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store"}
+
+
+def html_escape(s: str) -> str:
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;").replace("'", "&#39;"))
+
+
+@server.route("/eyecheck/save", methods=["POST"])
+def eyecheck_save():
+    data = flask_request.get_json(silent=True) or {}
+    athlete = str(data.get("athlete", ""))
+    if athlete not in _eye_athletes() or not eyecheck_token_ok(athlete, data.get("token", "")):
+        return jsonify({"ok": False, "error": "This link has expired — reopen Eye Check from Home."}), 403
+
+    row = {}
+    for key, col, _l, _u, _w, _f, (lo, hi) in EYE_METRICS:
+        v = _eye_num(data.get(key))
+        row[col] = round(v, 2) if (v is not None and lo <= v <= hi) else None
+    fs = _eye_num(data.get("pvt_false_starts"))
+    trials = _eye_num(data.get("pvt_trials"))
+    if all(row[c] is None for _k, c, *_ in EYE_METRICS):
+        return jsonify({"ok": False, "error": "No usable results to save — try again."}), 400
+
+    today = today_adl()
+    history = load_eye_rows(athlete)
+    _latest, before = _eye_split_today(history, today)
+    result = eyecheck_assess(row, before)
+
+    try:
+        ws = _eye_ws(create=True)
+        if ws is None:
+            raise RuntimeError("Google Sheets not connected")
+        vals = {"Athlete": athlete, "Date": str(today),
+                "Logged_At": dt.datetime.now(ADL_TZ).strftime("%Y-%m-%d %H:%M"),
+                **{c: ("" if row[c] is None else row[c]) for _k, c, *_ in EYE_METRICS},
+                "PVT_False_Starts": "" if fs is None else int(fs),
+                "PVT3_Trials": "" if trials is None else int(trials),
+                "Quality": str(data.get("quality", ""))[:120]}
+        head = ws.row_values(1) or EYE_HEADERS
+        ws.append_row([vals.get(h, "") for h in head], value_input_option="USER_ENTERED")
+        _eye_cache.pop("__all__", None)
+    except Exception as e:
+        print(f"❌ Eye Check save failed for {athlete}: {e}")
+        return jsonify({"ok": False, "error": "Couldn't save — check your connection and try again.",
+                        **result}), 500
+    return jsonify({"ok": True, **result})
+
+
+@app.callback(
+    Output("eyecheck-card", "children"),
+    Input("athlete-dropdown", "value"),
+    Input("today-date", "children"),
+    State("auth-store", "data"),
+)
+def render_eyecheck_card(athlete_id, _today, auth_data):
+    if not athlete_id or athlete_id not in _eye_athletes():
+        return None
+    is_coach = bool(auth_data and auth_data.get("is_coach"))
+    today = today_adl()
+    try:
+        latest, before = _eye_split_today(load_eye_rows(athlete_id), today)
+    except Exception:
+        latest, before = None, pd.DataFrame()
+    url = f"/eyecheck?athlete={requests.utils.quote(athlete_id)}&t={eyecheck_token(athlete_id, today)}"
+    link_style = {"display": "block", "textAlign": "center", "textDecoration": "none", "lineHeight": "44px"}
+
+    if latest is None:
+        if is_coach:
+            return None
+        return html.Div([
+            html.Div("EYE CHECK", className="ts-label"),
+            html.Div("How fresh are you really?", className="ts-title"),
+            html.Div("About 4 minutes · blinks, pupil response and a 3-minute reaction test, "
+                     "checked against your own normal", className="ts-meta"),
+            html.A("Start Eye Check", href=url, className="ts-log-btn", style=link_style),
+        ], className="ts-card")
+
+    res = eyecheck_assess(latest, before)
+    col, bg, border = _TONE.get(res["tone"], _TONE["normal"])
+    bits = []
+    for ln in res["lines"]:
+        mark = {"worse": " ↓", "better": " ↑"}.get(ln["flag"], "")
+        bits.append(f"{ln['label']} {ln['value']}{mark}")
+    children = [
+        html.Div("EYE CHECK · TODAY", className="ts-label"),
+        html.Div([
+            html.Div(res["verdict"], className="ts-advice-head", style={"color": col}),
+            html.Div(res["sub"], className="ts-advice-sub"),
+            html.Div(res.get("action", ""), className="ts-advice-sub",
+                     style={"marginTop": "4px", "fontWeight": "600", "color": "var(--text)"}),
+        ], className="ts-advice", style={"background": bg, "borderColor": border}),
+        html.Div(" · ".join(bits), className="ts-meta", style={"marginTop": "8px"}),
+    ]
+    if not is_coach:
+        children.append(html.A("Redo Eye Check", href=url, className="ts-meta",
+                               style={"display": "inline-block", "marginTop": "8px", "minHeight": "36px",
+                                      "lineHeight": "36px", "color": "var(--accent)", "fontWeight": "600"}))
+    return html.Div(children, className="ts-card")
+
+
+EYECHECK_HTML = r"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0d1117">
+<title>Eye Check · ADPTVV</title>
+<style>
+:root{--bg:#0d1117;--card:#161b22;--text:#e6ebf1;--muted:#9ca3af;--accent:#4dabf7;
+      --good:#2fb344;--watch:#f5b301;--bad:#f44336;--border:rgba(255,255,255,.12)}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{min-height:100%;background:var(--bg);color:var(--text);
+  font-family:-apple-system,BlinkMacSystemFont,system-ui,sans-serif;
+  -webkit-tap-highlight-color:transparent;touch-action:manipulation}
+body{display:flex;justify-content:center;
+  padding:max(16px,env(safe-area-inset-top)) 16px max(20px,env(safe-area-inset-bottom))}
+.wrap{width:100%;max-width:420px;display:flex;flex-direction:column;gap:14px}
+.top{display:flex;justify-content:space-between;align-items:center;min-height:44px}
+.top a{color:var(--accent);text-decoration:none;font-weight:600;font-size:15px;padding:10px 0}
+.step{font-size:13px;color:var(--muted)}
+h1{font-size:28px;font-weight:700;letter-spacing:-.01em}
+h2{font-size:20px;font-weight:700}
+p{font-size:15px;line-height:1.5;color:var(--muted)}
+.card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:16px;
+  display:flex;flex-direction:column;gap:10px}
+ol{padding-left:20px;color:var(--text);font-size:15px;line-height:1.55}
+ol li span{color:var(--muted)}
+.tips{font-size:14px;color:var(--muted);line-height:1.55}
+.btn{min-height:52px;border:none;border-radius:14px;background:var(--accent);color:#07121f;
+  font-size:17px;font-weight:700;width:100%;cursor:pointer;text-align:center;text-decoration:none;
+  display:flex;align-items:center;justify-content:center}
+.btn.ghost{background:transparent;border:1px solid var(--border);color:var(--text)}
+.btn:active{transform:scale(.98)}
+.camwrap{position:relative;width:100%;aspect-ratio:3/4;border-radius:22px;overflow:hidden;background:#000}
+video{width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}
+.oval{position:absolute;left:17%;right:17%;top:12%;bottom:18%;border:3px solid rgba(255,255,255,.35);
+  border-radius:50%;transition:border-color .2s}
+.oval.ok{border-color:rgba(47,179,68,.85)}
+.dot{position:absolute;left:50%;top:6%;width:14px;height:14px;margin-left:-7px;border-radius:50%;
+  background:var(--accent);box-shadow:0 0 0 6px rgba(77,171,247,.25)}
+.status{position:absolute;left:12px;right:12px;bottom:14px;text-align:center;font-size:15px;
+  font-weight:600;text-shadow:0 1px 4px #000}
+.bar{height:6px;border-radius:3px;background:var(--border);overflow:hidden}
+.bar>div{height:100%;width:0;background:var(--accent)}
+.overlay{position:fixed;inset:0;display:none;z-index:50;align-items:center;justify-content:center;
+  flex-direction:column;gap:16px;padding:24px;text-align:center;user-select:none;-webkit-user-select:none}
+#flash{background:#000;color:#777;font-size:15px}
+#flash .fdot{width:16px;height:16px;border-radius:50%;background:#555}
+#pvt{background:var(--bg);touch-action:none}
+#pvtdot{width:160px;height:160px;border-radius:50%;background:#222;display:flex;align-items:center;
+  justify-content:center;font-size:30px;font-weight:800;color:#fff}
+#pvtmsg{font-size:16px;color:var(--muted);max-width:280px;line-height:1.45}
+#pvtleft{font-size:13px;color:var(--muted)}
+.verdict{font-size:24px;font-weight:800}
+.row{display:flex;justify-content:space-between;align-items:baseline;gap:10px;padding:10px 0;
+  border-bottom:1px solid var(--border);font-size:15px}
+.row:last-child{border-bottom:none}
+.row .v{font-weight:700;text-align:right}
+.row .u{display:block;font-size:12.5px;color:var(--muted);font-weight:500}
+.worse{color:var(--watch)} .better{color:var(--good)}
+.note{font-size:12.5px;color:var(--muted);line-height:1.5}
+.refs{margin-top:8px;padding-top:14px;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:8px}
+.refs h3{font-size:13px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+.refs ol{padding-left:18px;display:flex;flex-direction:column;gap:6px}
+.refs li{font-size:12px;line-height:1.45;color:var(--muted)}
+.refs li i{color:var(--text);font-style:italic}
+.refs .disc{font-size:12px;line-height:1.45;color:var(--muted)}
+.hide{display:none!important}
+</style></head>
+<body><div class="wrap">
+
+<div class="top"><a href="/" id="backlink">‹ ADPTVV</a><span class="step" id="step"></span></div>
+
+<section id="intro" class="wrap" style="gap:14px">
+  <h1>Eye Check</h1>
+  <p>__FIRST__, this takes about 4 minutes. Your eyes and reactions are compared with your own normal,
+     so do it at a similar time each day — ideally before training, before caffeine.</p>
+  <div class="card">
+    <ol>
+      <li>Blinks <span>· 30 s, look at the screen and blink normally</span></li>
+      <li>Pupil response <span>· about 15 s, hold still while the screen flashes white twice</span></li>
+      <li>Reaction test <span>· 3 min, tap as soon as the circle turns green</span></li>
+    </ol>
+  </div>
+  <div class="tips">Sit at a table indoors in normal light, not facing a window. Turn screen brightness up
+    and remove sunglasses. Rest your elbows on the table (or prop the phone up) at reading distance,
+    with your face in the oval — do it the same way each day.
+    Put the phone on silent so nothing interrupts the reaction test.
+    The video never leaves your phone — only the results are saved.</div>
+  <button class="btn" id="startBtn">Start</button>
+</section>
+
+<section id="cam" class="wrap hide" style="gap:12px">
+  <h2 id="camTitle">Get ready</h2>
+  <div class="camwrap">
+    <video id="video" playsinline muted autoplay></video>
+    <div class="oval" id="oval"></div><div class="dot"></div>
+    <div class="status" id="status">Starting camera…</div>
+  </div>
+  <div class="bar"><div id="prog"></div></div>
+</section>
+
+<section id="result" class="wrap hide" style="gap:14px">
+  <div class="step">Eye Check result</div>
+  <div class="verdict" id="verdict"></div>
+  <p id="vsub"></p>
+  <div class="card" id="vactionCard" style="gap:4px">
+    <div class="step">What to do today</div>
+    <div id="vaction" style="font-size:16px;font-weight:600;line-height:1.45"></div>
+  </div>
+  <div class="card" id="rows" style="gap:0"></div>
+  <div class="note" id="qnote"></div>
+  <a class="btn" href="/">Done</a>
+</section>
+
+<section id="err" class="wrap hide" style="gap:14px">
+  <h2>Something went wrong</h2>
+  <p id="errmsg"></p>
+  <button class="btn" id="pvtOnlyBtn">Do the reaction test only (3 min)</button>
+  <button class="btn ghost" id="retryBtn">Try again</button>
+  <a class="btn ghost" href="/">Back to ADPTVV</a>
+</section>
+
+<section id="refs" class="refs">
+  <h3>Where these measures come from</h3>
+  <ol>
+    <li>Dinges DF, Grace R. <i>PERCLOS: A valid psychophysiological measure of alertness as assessed by
+      psychomotor vigilance.</i></li>
+    <li>Mariakakis A, Baudin J, Whitmire E, et al. <i>PupilScreen: Using smartphones to assess traumatic
+      brain injury.</i></li>
+    <li>Basner M, Mollicone D, Dinges DF. <i>Validity and sensitivity of a brief psychomotor vigilance test
+      (PVT-B) to total and partial sleep deprivation.</i></li>
+  </ol>
+  <p class="disc">Most of this research tested sleep loss rather than training fatigue, so ADPTVV
+    compares each result only with your own recent checks and treats it as one input alongside your check-in.
+    It is a wellness guide and exploratory, not a medical test.</p>
+</section>
+
+</div>
+
+<div class="overlay" id="flash"><div class="fdot"></div><div id="flashmsg">Keep looking at the dot</div></div>
+<div class="overlay" id="pvt">
+  <div id="pvtmsg">Tap anywhere the moment the circle turns green.</div>
+  <div id="pvtdot"></div>
+  <div id="pvtleft"></div>
+</div>
+
+<script type="module">
+const ATHLETE = __ATHLETE__, TOKEN = __TOKEN__;
+const MP = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+const MODEL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
+const $ = id => document.getElementById(id);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const video = $("video");
+let landmarker = null, stream = null;
+const out = {}; const quality = [];
+
+function show(id){ for (const s of ["intro","cam","result","err"]) $(s).classList.toggle("hide", s !== id);
+  $("refs").classList.toggle("hide", !(id === "intro" || id === "result")); }
+function step(t){ $("step").textContent = t || ""; }
+function status(t){ $("status").textContent = t; }
+function prog(f){ $("prog").style.width = Math.max(0, Math.min(1, f)) * 100 + "%"; }
+const median = a => { if(!a.length) return null; const s=[...a].sort((x,y)=>x-y), m=s.length>>1;
+  return s.length % 2 ? s[m] : (s[m-1]+s[m])/2; };
+const pct = (a,p) => { if(!a.length) return null; const s=[...a].sort((x,y)=>x-y);
+  return s[Math.min(s.length-1, Math.max(0, Math.round(p*(s.length-1))))]; };
+
+function fail(msg){ stopCam(); $("errmsg").textContent = msg; show("err"); step(""); }
+function stopCam(){ if(stream){ stream.getTracks().forEach(t => t.stop()); stream = null; } }
+
+async function startCam(){
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia)
+    throw new Error("nocam");
+  stream = await navigator.mediaDevices.getUserMedia({audio:false,
+    video:{facingMode:"user", width:{ideal:1280}, height:{ideal:720}, frameRate:{ideal:60}}});
+  video.srcObject = stream;
+  await video.play();
+}
+
+async function loadModel(){
+  const { FaceLandmarker, FilesetResolver } = await import(MP);
+  const fs = await FilesetResolver.forVisionTasks(MP + "/wasm");
+  const opts = d => ({ baseOptions:{ modelAssetPath: MODEL, delegate: d }, runningMode:"VIDEO",
+                       numFaces:1, outputFaceBlendshapes:true });
+  try { return await FaceLandmarker.createFromOptions(fs, opts("GPU")); }
+  catch(e){ return await FaceLandmarker.createFromOptions(fs, opts("CPU")); }
+}
+
+// Run the face tracker on every new camera frame for `ms` milliseconds.
+function runFor(ms, onFrame, onTick){
+  return new Promise(resolve => {
+    const t0 = performance.now(); let lastT = -1;
+    function loop(){
+      const now = performance.now(), el = now - t0;
+      if(el >= ms){ resolve(); return; }
+      if(video.readyState >= 2 && video.currentTime !== lastT){
+        lastT = video.currentTime;
+        let r = null; try { r = landmarker.detectForVideo(video, now); } catch(e) {}
+        onFrame(r, el);
+      }
+      if(onTick && onTick(el / ms, el) === true){ resolve(); return; }
+      requestAnimationFrame(loop);
+    }
+    requestAnimationFrame(loop);
+  });
+}
+
+const hasFace = r => !!(r && r.faceLandmarks && r.faceLandmarks.length);
+
+async function waitForFace(){
+  $("camTitle").textContent = "Fit your face in the oval";
+  let okSince = null; const t0 = performance.now();
+  while(true){
+    let r = null; try { r = landmarker.detectForVideo(video, performance.now()); } catch(e) {}
+    const ok = hasFace(r);
+    $("oval").classList.toggle("ok", ok);
+    if(ok){ okSince = okSince || performance.now(); status("Hold still…");
+            if(performance.now() - okSince > 1200) return true; }
+    else { okSince = null; status("Move so your whole face is in the oval"); }
+    if(performance.now() - t0 > 20000) return false;
+    await sleep(60);
+  }
+}
+
+// ---------- 1. Blinks ----------
+async function blinkTest(){
+  step("1 of 3"); $("camTitle").textContent = "Blinks";
+  const samples = []; let frames = 0, lastSeen = 0;
+  await runFor(30000, (r, t) => {
+    frames++;
+    const bs = r && r.faceBlendshapes && r.faceBlendshapes[0];
+    if(!bs){ samples.push({t, s:null}); return; }
+    lastSeen = t;
+    const g = n => (bs.categories.find(c => c.categoryName === n) || {score:0}).score;
+    samples.push({t, s:(g("eyeBlinkLeft") + g("eyeBlinkRight")) / 2});
+  }, (f, el) => {
+    prog(f);
+    const lost = el - lastSeen > 400;
+    $("oval").classList.toggle("ok", !lost);
+    status(lost ? "Keep your face in the oval"
+                : `Look at the blue dot and blink normally · ${Math.ceil((30000-el)/1000)} s`);
+  });
+
+  const valid = samples.filter(x => x.s !== null);
+  const faceRate = frames ? valid.length / frames : 0;
+  if(valid.length < 60 || faceRate < 0.6){ quality.push("blinks: face not tracked well"); return; }
+  // Thresholds adapt to each person's resting eyelid position.
+  const m = median(valid.map(x => x.s));
+  const thr = Math.min(0.8, Math.max(0.35, m + 0.5 * (1 - m)));
+  const p80 = m + 0.8 * (1 - m);
+  let validTime = 0, p80Time = 0, closedStart = null; const blinks = [];
+  for(let i = 1; i < samples.length; i++){
+    const a = samples[i-1], b = samples[i];
+    if(b.s === null){ closedStart = null; continue; }
+    const dt = Math.min(b.t - a.t, 100);
+    validTime += dt;
+    if(b.s >= p80) p80Time += dt;
+    if(b.s >= thr){ if(closedStart === null) closedStart = b.t; }
+    else if(closedStart !== null){
+      const d = b.t - closedStart;
+      if(d >= 40 && d <= 600) blinks.push(d);
+      closedStart = null;
+    }
+  }
+  if(validTime < 15000){ quality.push("blinks: too little tracked time"); return; }
+  out.blink_rate = +(blinks.length / (validTime / 60000)).toFixed(1);
+  if(blinks.length >= 3) out.blink_dur = Math.round(median(blinks));
+  out.perclos = +(p80Time / validTime * 100).toFixed(2);
+  if(faceRate < 0.85) quality.push("blinks: some frames lost");
+}
+
+// ---------- 2. Pupil response ----------
+const cvs = document.createElement("canvas");
+const ctx = cvs.getContext("2d", { willReadFrequently: true });
+
+// Pupil-to-iris size ratio from the dark pixels inside the iris circle.
+function irisRadius(lm, centreIdx, ringIdx){
+  const W = video.videoWidth, H = video.videoHeight;
+  const c = lm[centreIdx]; let r = 0;
+  for(const i of ringIdx){ r += Math.hypot((lm[i].x - c.x) * W, (lm[i].y - c.y) * H); }
+  return r / ringIdx.length;
+}
+
+function pupilRatio(lm, centreIdx, ringIdx){
+  const W = video.videoWidth, H = video.videoHeight;
+  const c = lm[centreIdx]; const cx = c.x * W, cy = c.y * H;
+  const r = irisRadius(lm, centreIdx, ringIdx);
+  if(r < 8) return null;                                   // eye too small in frame
+  const n = Math.ceil(2 * r), sx = Math.round(cx - r), sy = Math.round(cy - r);
+  if(sx < 0 || sy < 0 || sx + n > W || sy + n > H) return null;
+  cvs.width = n; cvs.height = n;
+  ctx.drawImage(video, sx, sy, n, n, 0, 0, n, n);
+  const d = ctx.getImageData(0, 0, n, n).data;
+  const lum = [], rr = (0.85 * r) ** 2;
+  for(let y = 0; y < n; y++) for(let x = 0; x < n; x++){
+    const dx = x - r, dy = y - r; if(dx*dx + dy*dy > rr) continue;
+    const k = (y * n + x) * 4; lum.push(0.299*d[k] + 0.587*d[k+1] + 0.114*d[k+2]);
+  }
+  if(lum.length < 50) return null;
+  const lo = pct(lum, 0.05), mid = pct(lum, 0.6);
+  if(mid - lo < 12) return null;                           // no pupil/iris contrast
+  const thr = lo + 0.4 * (mid - lo);
+  let dark = 0; for(const v of lum) if(v < thr) dark++;
+  return Math.sqrt(dark / lum.length);
+}
+
+// Steadiness limits. Motion = how far the eyes move per frame, in iris-widths,
+// smoothed — so it scales with distance and ignores normal landmark jitter.
+const STEADY_MOTION = 0.08, MIN_IRIS_PX = 9;
+
+async function pupilTest(){
+  step("2 of 3"); prog(0);
+  const fl = $("flash"), msg = $("flashmsg"), fdot = document.querySelector("#flash .fdot");
+  fl.style.display = "flex"; fl.style.background = "#000";
+  // A flash only fires once the athlete has been steady for long enough to give a clean
+  // baseline, so a shaky moment delays the flash instead of wasting it.
+  const N_FLASHES = 2, NEED_STEADY = 2500, FLASH_MS = 700, AFTER = 2200, MAX_MS = 40000;
+  const samples = [], flashes = [];
+  let steadySince = null, flashAt = null, lastC = null, motion = 0, radius = 0, lastSeen = -1e9;
+  let shown = "";
+
+  function say(text, warn){
+    const key = text + warn;
+    if(key === shown) return; shown = key;
+    msg.textContent = text;
+    msg.style.color = warn ? "#f5b301" : "#777";
+    msg.style.fontSize = warn ? "22px" : "15px";
+    msg.style.fontWeight = warn ? "700" : "400";
+  }
+
+  await runFor(MAX_MS, (r, t) => {
+    if(!hasFace(r)){ lastC = null; steadySince = null; return; }
+    const lm = r.faceLandmarks[0]; if(lm.length < 478) return;
+    lastSeen = t;
+    const W = video.videoWidth, H = video.videoHeight;
+    const cx = (lm[468].x + lm[473].x) / 2 * W, cy = (lm[468].y + lm[473].y) / 2 * H;
+    radius = (irisRadius(lm, 468, [469,470,471,472]) + irisRadius(lm, 473, [474,475,476,477])) / 2;
+    if(lastC) motion = 0.7 * motion + 0.3 * Math.hypot(cx - lastC.x, cy - lastC.y) / Math.max(radius, 1);
+    lastC = {x: cx, y: cy};
+    const steady = motion < STEADY_MOTION && radius >= MIN_IRIS_PX;
+    if(steady){ if(steadySince === null) steadySince = t; } else steadySince = null;
+
+    const a = pupilRatio(lm, 468, [469,470,471,472]);
+    const b = pupilRatio(lm, 473, [474,475,476,477]);
+    const v = [a, b].filter(x => x !== null);
+    if(v.length) samples.push({t, v: v.reduce((x,y) => x+y, 0) / v.length, m: motion});
+  }, (f, el) => {
+    // --- flash scheduling ---
+    if(flashAt !== null){
+      const since = el - flashAt;
+      if(since >= FLASH_MS && fl.style.background !== "rgb(0, 0, 0)"){
+        fl.style.background = "#000"; msg.style.visibility = "visible";
+      }
+      if(since >= FLASH_MS + AFTER){
+        flashAt = null; steadySince = null;          // a fresh steady spell before the next flash
+        prog(flashes.length / N_FLASHES);
+        if(flashes.length >= N_FLASHES) return true;
+      }
+    } else if(steadySince !== null && el - steadySince >= NEED_STEADY){
+      flashAt = el; flashes.push(el);
+      fl.style.background = "#fff"; msg.style.visibility = "hidden";
+      return false;
+    }
+    if(flashAt !== null && el - flashAt < FLASH_MS) return false;   // screen is white
+
+    // --- live feedback (on the dark screen) ---
+    const lost = el - lastSeen > 400;
+    if(lost){ say("Keep your face in view", true); fdot.style.background = "#f5b301"; }
+    else if(radius && radius < MIN_IRIS_PX){ say("Bring the phone a little closer", true); fdot.style.background = "#f5b301"; }
+    else if(motion >= STEADY_MOTION){ say("Hold still", true); fdot.style.background = "#f5b301"; }
+    else {
+      fdot.style.background = "#2fb344";
+      say(flashAt !== null ? "Good — keep still and keep looking at the dot"
+                           : "Good — hold it there. The screen will flash white.", false);
+    }
+    return false;
+  });
+  fl.style.display = "none"; msg.style.visibility = "visible";
+  fdot.style.background = "#555";
+
+  const results = [];
+  let moved = 0;
+  for(const s of flashes){
+    const win = samples.filter(x => x.t >= s - 1500 && x.t <= s + 1600);
+    if(win.some(x => x.m >= STEADY_MOTION * 1.5)){ moved++; continue; }   // moved during the response
+    const base = samples.filter(x => x.t >= s - 1500 && x.t < s).map(x => x.v);
+    const post = samples.filter(x => x.t >= s + 150 && x.t <= s + 1600);
+    if(base.length < 8 || post.length < 8) continue;
+    const b = median(base);
+    const spread = (pct(base, 0.9) - pct(base, 0.1)) / b;
+    if(!b || spread > 0.3) continue;                       // baseline too noisy to trust
+    let lowest = Infinity;
+    for(let i = 1; i < post.length - 1; i++){
+      const sm = (post[i-1].v + post[i].v + post[i+1].v) / 3; if(sm < lowest) lowest = sm;
+    }
+    const c = (b - lowest) / b * 100;
+    if(c > -10 && c < 70) results.push(c);
+  }
+  if(results.length){
+    out.pupil = +(results.reduce((x,y) => x+y, 0) / results.length).toFixed(1);
+    if(results.length < N_FLASHES) quality.push("pupil: one flash unreadable");
+  } else if(flashes.length < N_FLASHES){
+    quality.push("pupil: couldn't hold steady long enough — try resting your elbows on a table");
+  } else if(moved){
+    quality.push("pupil: the phone moved during the flash — try resting your elbows on a table");
+  } else {
+    quality.push("pupil: couldn't read your pupils (common with dark eyes or low light)");
+  }
+}
+
+// ---------- 3. Reaction test (brief PVT) ----------
+function reactionTest(totalMs = 180000){
+  return new Promise(resolve => {
+    step("3 of 3");
+    const ov = $("pvt"), dot = $("pvtdot"); ov.style.display = "flex";
+    const rts = []; let falseStarts = 0, state = "intro", onset = 0, timer = null;
+    let tEnd = 0;
+    const left = setInterval(() => {
+      if(!tEnd) return;
+      const s = Math.max(0, Math.ceil((tEnd - performance.now()) / 1000));
+      $("pvtleft").textContent = Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0") + " left";
+    }, 250);
+    function next(){
+      if(performance.now() >= tEnd){ finish(); return; }
+      state = "wait"; dot.style.background = "#222"; dot.textContent = "";
+      timer = setTimeout(go, 1000 + Math.random() * 3000);   // 1–4 s, as in the validated 3-min PVT
+    }
+    function go(){
+      state = "go"; onset = performance.now(); dot.style.background = "#2fb344";
+      const tick = () => { if(state !== "go") return;
+        dot.textContent = Math.round(performance.now() - onset); requestAnimationFrame(tick); };
+      tick();
+      timer = setTimeout(() => { if(state === "go"){ state = "shown"; rts.push(1500);
+        dot.style.background = "#f44336"; dot.textContent = "Missed"; setTimeout(next, 700); } }, 1500);
+    }
+    function tap(e){
+      e.preventDefault();
+      if(state === "go" && performance.now() - onset < 100){   // faster than humanly possible = anticipation
+        clearTimeout(timer); falseStarts++; state = "shown";
+        dot.textContent = "Too soon"; dot.style.fontSize = "22px"; dot.style.background = "#5a3a00";
+        setTimeout(() => { dot.style.fontSize = ""; next(); }, 800);
+      } else if(state === "go"){
+        const rt = performance.now() - onset; clearTimeout(timer); state = "shown";
+        rts.push(rt); dot.textContent = Math.round(rt); dot.style.background = "#1e3a5f";
+        setTimeout(next, 600);
+      } else if(state === "wait"){
+        clearTimeout(timer); falseStarts++; state = "shown";
+        dot.textContent = "Too soon"; dot.style.fontSize = "22px"; dot.style.background = "#5a3a00";
+        setTimeout(() => { dot.style.fontSize = ""; next(); }, 800);
+      }
+    }
+    function finish(){
+      clearInterval(left); ov.removeEventListener("pointerdown", tap);
+      document.removeEventListener("visibilitychange", onHide); ov.style.display = "none";
+      const hits = rts.filter(x => x < 1500);
+      if(hits.length >= 20){
+        out.pvt_median = Math.round(median(hits));
+        out.pvt_lapses = rts.filter(x => x > 355).length;   // Basner 2011 threshold for the 3-min PVT
+      } else quality.push("reaction: too few responses — stay on the screen for the full 3 minutes");
+      out.pvt_trials = rts.length;
+      out.pvt_false_starts = falseStarts;
+      resolve();
+    }
+    ov.addEventListener("pointerdown", tap);
+    const onHide = () => { if(document.hidden && tEnd){ quality.push("reaction: app was left during the test");
+      rts.length = 0; } };
+    document.addEventListener("visibilitychange", onHide);
+    dot.style.background = "#222"; dot.textContent = "";
+    $("pvtmsg").textContent = "Tap anywhere the moment the circle turns green. Starting…";
+    setTimeout(() => { $("pvtmsg").textContent = "Tap anywhere the moment the circle turns green.";
+                       tEnd = performance.now() + totalMs; next(); }, 2000);
+  });
+}
+
+// ---------- Save + show result ----------
+async function save(){
+  show("cam"); $("camTitle").textContent = "Saving"; status("Saving your results…"); prog(1);
+  let res;
+  try {
+    const r = await fetch("/eyecheck/save", { method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ athlete: ATHLETE, token: TOKEN, quality: quality.join("; "), ...out }) });
+    res = await r.json();
+    if(!r.ok || !res.ok){ fail(res.error || "Couldn't save your results."); return; }
+  } catch(e){ fail("Couldn't reach ADPTVV to save — check your connection and try again."); return; }
+  const col = {good:"var(--good)", watch:"var(--watch)", bad:"var(--bad)"}[res.tone] || "var(--text)";
+  $("verdict").textContent = res.verdict; $("verdict").style.color = col;
+  $("vsub").textContent = res.sub || "";
+  $("vaction").textContent = res.action || "";
+  $("vactionCard").classList.toggle("hide", !res.action);
+  $("rows").innerHTML = "";
+  for(const ln of res.lines){
+    const row = document.createElement("div"); row.className = "row";
+    const l = document.createElement("span"); l.textContent = ln.label;
+    const v = document.createElement("span"); v.className = "v" + (ln.flag !== "normal" ? " " + ln.flag : "");
+    v.textContent = ln.value + (ln.flag === "worse" ? " ↓" : ln.flag === "better" ? " ↑" : "");
+    if(ln.usual){ const u = document.createElement("span"); u.className = "u"; u.textContent = ln.usual; v.appendChild(u); }
+    row.append(l, v); $("rows").appendChild(row);
+  }
+  $("qnote").textContent = (quality.length ? "Notes: " + quality.join("; ") + ". " : "") +
+    "This is a training-readiness guide, not a medical test.";
+  step(""); show("result");
+}
+
+async function runAll(){
+  show("cam"); step(""); prog(0); for(const k in out) delete out[k]; quality.length = 0;
+  try { await startCam(); }
+  catch(e){ fail(e && e.name === "NotAllowedError"
+      ? "Camera access was blocked. Allow camera access for this site (iPhone: Settings → Safari → Camera), then try again."
+      : "The front camera couldn't be started on this device."); return; }
+  status("Loading the face tracker…");
+  try { landmarker = landmarker || await loadModel(); }
+  catch(e){ fail("Couldn't load the face tracker — check your connection and try again."); return; }
+  if(!await waitForFace()){ fail("Your face wasn't found. Try better light and hold the phone at reading distance."); return; }
+  await blinkTest();
+  await pupilTest();
+  stopCam();
+  await reactionTest();
+  await save();
+}
+
+$("startBtn").onclick = runAll;
+$("retryBtn").onclick = runAll;
+$("pvtOnlyBtn").onclick = async () => {
+  for(const k in out) delete out[k]; quality.length = 0; quality.push("reaction test only");
+  show("cam"); await reactionTest(); await save();
+};
+</script>
+</body></html>
+"""
+
 
 
 if __name__ == "__main__":
