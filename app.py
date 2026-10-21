@@ -10291,7 +10291,21 @@ def render_eyecheck_card(athlete_id, _today, auth_data):
 
     if latest is None:
         if is_coach:
-            return None
+            # Coaches can't run a check for an athlete, but should see that it's switched on.
+            last = None
+            try:
+                rows = load_eye_rows(athlete_id)
+                if not rows.empty:
+                    last = pd.to_datetime(rows["Date"], errors="coerce").dropna().max()
+            except Exception:
+                pass
+            when = (f"Last check {last.strftime('%d %b').lstrip('0')}" if last is not None and pd.notna(last)
+                    else "No checks yet")
+            return html.Div([
+                html.Div("EYE CHECK", className="ts-label"),
+                html.Div("Not done today", className="ts-title"),
+                html.Div(f"{when} · the athlete starts it from their own Home screen", className="ts-meta"),
+            ], className="ts-card")
         return html.Div([
             html.Div("EYE CHECK", className="ts-label"),
             html.Div("How fresh are you really?", className="ts-title"),
