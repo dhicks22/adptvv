@@ -1,13 +1,5 @@
-# app.py — consolidated + FIXED version
-# Key fixes:
-# 1) ✅ No more NaTType.start_time crash: _week_agg_date() is now NaT-safe (uses week_bucket()).
-# 2) ✅ Removed duplicate/contradictory definitions (dial_class_from_score, bottom_nav, imports, etc.)
-# 3) ✅ Removed the broken commented-out _build_dial block that was causing indentation/parse issues.
-# 4) ✅ Kept your structure + UI intact, but made the weekly bucketing + plotting robust.
-# 5) ✅ Session log popup: clicking a logged day shows a read-only summary modal.
-#       Clicking an unlogged day opens the session input form as before.
-# 6) ✅ Duplicate date deduplication before reindex (fixes ValueError: cannot reindex on duplicate labels).
-# 7) ✅ load_tab now fetches FORMATTED_VALUE for Date column so serial numbers (=C206+1) parse correctly.
+# app.py — ADPTVV (Powered by AdaptivIQ)
+# Dash app on Render: Google Sheets per-athlete tabs, Claude for insights and the AdaptivIQ chat.
 
 import os
 import re
@@ -31,7 +23,7 @@ from dash import Dash, html, dcc, Input, Output, State, ALL, callback_context, n
 import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 from dash.exceptions import PreventUpdate
-from flask import redirect, request as flask_request, jsonify
+from flask import redirect, request as flask_request, jsonify, session as flask_session
 
 
 # ============================================================
@@ -4549,6 +4541,12 @@ app = Dash(
 )
 
 server = app.server
+# Signs the login cookie so the server (not the browser) knows who is logged in.
+# Set FLASK_SECRET_KEY on Render to keep logins valid across redeploys.
+server.secret_key = os.getenv("FLASK_SECRET_KEY") or hashlib.sha256(
+    ((os.getenv("GS_SERVICE_JSON") or "") + "|adptvv-session").encode()).hexdigest()
+server.config.update(SESSION_COOKIE_SAMESITE="Lax", SESSION_COOKIE_HTTPONLY=True,
+                     SESSION_COOKIE_SECURE=bool(os.getenv("RENDER")))
 app._favicon = "icon-192.png"
 
 app.index_string = """
@@ -4578,6 +4576,119 @@ app.index_string = """
         <link rel="apple-touch-icon" href="/assets/icon-192.png">
         <title>ADPTVV</title>
         <style>
+          /* ---- AdaptivIQ chat ---- */
+          #chat-view { padding: 22px 16px 120px 16px; }
+          .chat-title { font-size: 28px; font-weight: 600; margin: 0; color: var(--text); line-height: 1.05; }
+          .chat-sub { color: var(--text-muted); font-size: 13.5px; margin: 6px 0 14px 0; line-height: 1.45; }
+          .chat-log { display: flex; flex-direction: column; gap: 10px; }
+          .chat-msg { max-width: 88%; padding: 10px 13px; border-radius: 16px; font-size: 15.5px; line-height: 1.45; }
+          .chat-msg p { margin: 0 0 6px 0; } .chat-msg p:last-child { margin-bottom: 0; }
+          .chat-msg ul { margin: 4px 0 4px 18px; padding: 0; }
+          .chat-me { align-self: flex-end; background: var(--accent, #1e88e5); color: #fff; border-bottom-right-radius: 6px; }
+          .chat-ai { align-self: flex-start; background: var(--card-bg); color: var(--text);
+                     border: 1px solid var(--border); border-bottom-left-radius: 6px; }
+          .chat-who { font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+                      color: var(--text-muted); margin-bottom: 4px; display: flex; align-items: center; gap: 6px; }
+          .chat-chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0 12px 0; }
+          .chat-chip { background: var(--card-bg); color: var(--text); border: 1px solid var(--border);
+                       border-radius: 999px; padding: 8px 12px; font-size: 14px; cursor: pointer; text-align: left;
+                       -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
+          .chat-chip:active { transform: scale(.98); }
+          .chat-bar { position: fixed; left: 0; right: 0; bottom: 74px; z-index: 40; padding: 8px 12px;
+                      background: linear-gradient(180deg, transparent, var(--bg) 35%); }
+          .chat-bar-in { max-width: 720px; margin: 0 auto; display: flex; gap: 8px; align-items: center;
+                         background: var(--card-bg); border: 1px solid var(--border); border-radius: 18px; padding: 6px 6px 6px 14px;
+                         box-shadow: 0 6px 20px rgba(0,0,0,.18); }
+          #chat-input { flex: 1; border: none !important; background: transparent !important; box-shadow: none !important;
+                        font-size: 16px; padding: 8px 0 !important; color: var(--text) !important; outline: none; }
+          .chat-bar-in .dash-input-container { flex: 1; background: transparent !important; border: none !important;
+                                               box-shadow: none !important; padding: 0 !important; min-width: 0; }
+          #chat-input:focus { outline: none !important; box-shadow: none !important; }
+          .chat-bar-in .dash-input-container:focus-within { outline: none !important; box-shadow: none !important;
+                                                            border: none !important; }
+          .chat-bar-in:focus-within { border-color: var(--accent) !important; }
+          #chat-send { width: 42px; height: 42px; border-radius: 12px; border: none; flex: none;
+                       background: var(--accent, #1e88e5); color: #fff; font-size: 18px; display: flex;
+                       align-items: center; justify-content: center; }
+          .chat-note { font-size: 12px; color: var(--text-muted); line-height: 1.45; margin-top: 14px; }
+          .chat-clear { background: none; border: none; color: var(--accent); font-weight: 600; font-size: 14px;
+                        padding: 6px 0; min-height: 36px; }
+          .chat-typing { min-height: 8px; }
+          .chat-context { display: flex; gap: 8px; align-items: flex-start; font-size: 12.5px; line-height: 1.4;
+                          color: var(--text-muted); background: var(--card-bg); border: 1px solid var(--border);
+                          border-radius: 12px; padding: 9px 11px; margin: -4px 0 12px 0; }
+          .chat-context .bi { color: var(--accent); font-size: 15px; margin-top: 1px; }
+          .chat-basis { margin-top: 6px; font-size: 11.5px; color: var(--text-muted); }
+          .chat-thinking { margin-top: 10px; min-width: 230px; }
+          .chat-think-row { display: flex; align-items: center; gap: 10px; }
+          .chat-ekg { width: 70px; height: 26px; flex: none; overflow: hidden; position: relative; }
+          .chat-ekg-line { position: absolute; inset: 0; width: 140px;
+            background: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='70' height='26' viewBox='0 0 70 26'><polyline fill='none' stroke='%234dabf7' stroke-width='2' stroke-linejoin='round' stroke-linecap='round' points='0,13 18,13 23,13 27,4 31,22 35,13 40,13 46,10 50,13 70,13'/></svg>") repeat-x;
+            background-size: 70px 26px; animation: ekg-scroll 1.1s linear infinite; }
+          .chat-ekg::after { content: ""; position: absolute; inset: 0;
+            background: linear-gradient(90deg, var(--card-bg) 0%, transparent 25%, transparent 75%, var(--card-bg) 100%); }
+          @keyframes ekg-scroll { from { transform: translateX(0); } to { transform: translateX(-70px); } }
+          .chat-think-txt { position: relative; height: 20px; flex: 1; font-size: 14.5px; color: var(--text-muted); }
+          .chat-think-txt span { position: absolute; left: 0; top: 0; white-space: nowrap; opacity: 0;
+                                 animation: think-cycle 4.5s infinite; }
+          .chat-think-txt span:nth-child(2) { animation-delay: 1.5s; }
+          .chat-think-txt span:nth-child(3) { animation-delay: 3s; }
+          @keyframes think-cycle { 0% { opacity: 0; } 6% { opacity: 1; } 30% { opacity: 1; } 36% { opacity: 0; } 100% { opacity: 0; } }
+          @media (prefers-reduced-motion: reduce) {
+            .chat-ekg-line { animation: none; } .chat-think-txt span:first-child { opacity: 1; animation: none; }
+          }
+
+          /* ---- Save & get feedback button ---- */
+          #btn-generate-ai.ai-save-btn {
+            display: flex !important; align-items: center; justify-content: center; gap: 8px;
+            width: 100% !important; min-height: 54px; padding: 14px 18px !important;
+            background: linear-gradient(180deg, #34c759 0%, #26a344 100%) !important;
+            border: none !important; border-radius: 14px !important; color: #fff !important;
+            font-size: 18px !important; font-weight: 700 !important; letter-spacing: .01em;
+            box-shadow: 0 6px 18px rgba(38, 163, 68, .35), inset 0 1px 0 rgba(255,255,255,.25);
+            transition: transform .08s ease, box-shadow .12s ease, filter .12s ease;
+            -webkit-tap-highlight-color: transparent; touch-action: manipulation;
+          }
+          #btn-generate-ai.ai-save-btn .bi { font-size: 20px; line-height: 1; }
+          #btn-generate-ai.ai-save-btn:hover { filter: brightness(1.05); }
+          #btn-generate-ai.ai-save-btn:active { transform: scale(.98); box-shadow: 0 2px 8px rgba(38,163,68,.3); }
+          #btn-generate-ai.ai-save-btn:disabled { filter: grayscale(.4) brightness(.9); box-shadow: none; }
+          /* ---- Feedback picker (smart pick) ---- */
+          .lens-card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 16px;
+                       padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+          .lens-head { font-size: 12px; letter-spacing: .08em; font-weight: 700; color: var(--text-muted);
+                       text-transform: uppercase; }
+          .lens-chips { display: flex; gap: 8px; flex-wrap: wrap; }
+          .lens-chip { display: inline-flex; align-items: center; gap: 6px; border-radius: 999px;
+                       padding: 8px 14px; font-size: 16px; font-weight: 700; line-height: 1; }
+          .lens-chip small { font-size: 11px; font-weight: 700; opacity: .75; }
+          .lens-why { font-size: 14px; line-height: 1.4; color: var(--text-muted); }
+          .lens-why b { color: var(--text); font-weight: 600; }
+          .lens-change { align-self: flex-start; background: none; border: none; padding: 6px 0; min-height: 36px;
+                         color: var(--accent); font-weight: 700; font-size: 15px; cursor: pointer; }
+          .lens-panel { display: flex; flex-direction: column; gap: 8px; }
+          .lens-q { display: flex; align-items: center; gap: 12px; width: 100%; text-align: left;
+                    background: var(--bg); border: 1.5px solid var(--border); border-radius: 14px;
+                    padding: 11px 12px; color: var(--text); cursor: pointer; min-height: 56px;
+                    -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
+          .lens-q .lq-ic { width: 36px; height: 36px; border-radius: 10px; flex: none; font-size: 18px;
+                           display: flex; align-items: center; justify-content: center; }
+          .lens-chip .bi { font-size: 15px; line-height: 1; }
+          .lens-q .lq-t { font-size: 16px; font-weight: 700; line-height: 1.2; }
+          .lens-q .lq-s { display: block; font-size: 12.5px; font-weight: 500; color: var(--text-muted); }
+          .lens-q .lq-n { margin-left: auto; width: 26px; height: 26px; border-radius: 50%; flex: none;
+                          border: 2px solid var(--border); font-size: 13px; font-weight: 800;
+                          display: flex; align-items: center; justify-content: center; color: #fff; }
+          .lens-q.pick1 { border-color: #2f80ed; background: rgba(47,128,237,.12); }
+          .lens-q.pick1 .lq-n { background: #2f80ed; border-color: #2f80ed; }
+          .lens-q.pick2 { border-color: #2fb344; background: rgba(47,179,68,.12); }
+          .lens-q.pick2 .lq-n { background: #2fb344; border-color: #2fb344; }
+          .lens-hint { font-size: 12.5px; color: var(--text-muted); }
+          .lens-hist { display: flex; flex-direction: column; gap: 5px; margin-top: 2px; }
+          .lens-hist-row { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--text-muted); }
+          .lens-hist-row .lh-l { width: 70px; flex: none; }
+          .lens-hist-row .lh-b { height: 7px; border-radius: 4px; min-width: 3px; }
+          .lens-hist-row .lh-n { font-variant-numeric: tabular-nums; }
           .coach-radio {
             display: flex;
             flex-wrap: wrap;
@@ -5279,38 +5390,9 @@ def build_main_layout(auth_data):
                             ], className="lw-block"),
                         ], md=6),
                         dbc.Col([
-                            html.Div([
-                                dbc.Label("Primary ADPTVV insight (select one)"),
-                                dcc.RadioItems(
-                                    id="ai-mode-1",
-                                    options=[
-                                        {"label": "Acceleration & Speed", "value": "Acceleration & Speed Coach"},
-                                        {"label": "Tempo & Endurance", "value": "Tempo & Endurance Coach"},
-                                        {"label": "Technical Sprint", "value": "Technical Sprint Coach"},
-                                        {"label": "Strength & Power", "value": "Strength & Power Coach"},
-                                        {"label": "Recovery & Readiness", "value": "Recovery & Readiness Coach"},
-                                    ],
-                                    value=None, className="coach-radio",
-                                    inputClassName="coach-radio-input", labelClassName="coach-radio-label",
-                                ),
-                            ], style={"marginBottom": "16px"}),
-                            html.Div([
-                                dbc.Label("Secondary ADPTVV insight (select one)"),
-                                dcc.RadioItems(
-                                    id="ai-mode-2",
-                                    options=[
-                                        {"label": "Acceleration & Speed", "value": "Acceleration & Speed Coach"},
-                                        {"label": "Tempo & Endurance", "value": "Tempo & Endurance Coach"},
-                                        {"label": "Technical Sprint", "value": "Technical Sprint Coach"},
-                                        {"label": "Strength & Power", "value": "Strength & Power Coach"},
-                                        {"label": "Recovery & Readiness", "value": "Recovery & Readiness Coach"},
-                                    ],
-                                    value=None, className="coach-radio",
-                                    inputClassName="coach-radio-input", labelClassName="coach-radio-label",
-                                ),
-                            ], style={"marginBottom": "4px"}),
-                            dbc.Button("Log Session & Generate ADPTVV insights",
-                                       id="btn-generate-ai", className="mt-4 w-100 ai-save-btn"),
+                            lens_picker_layout(),
+                            dbc.Button([html.I(className="bi bi-check2-circle"), html.Span("Save & get feedback")],
+                                       id="btn-generate-ai", className="mt-3 w-100 ai-save-btn"),
                             html.Div(id="save-status", className="mt-2"),
                             dcc.Loading(id="ai-loader", type="circle", children=[
                                 html.Div(id="ai-suggestion-1", className="mt-3"),
@@ -5577,6 +5659,8 @@ def build_main_layout(auth_data):
         ],
     )
 
+    chat_view = chat_view_layout() if not is_coach else html.Div(id="chat-view", style={"display": "none"})
+
     # Bottom nav — add Squad tab for coaches
     nav_cols = [
         dbc.Col(html.Div([html.I(id="icon-home", className="bi bi-house nav-icon"),
@@ -5599,7 +5683,14 @@ def build_main_layout(auth_data):
                              id="nav-squad", n_clicks=0, className="nav-item"))
         )
     else:
-        nav_cols.append(dbc.Col(html.Div(id="nav-squad", n_clicks=0, style={"display": "none"})))
+        nav_cols.append(
+            dbc.Col(html.Div([html.I(id="icon-chat", className="bi bi-chat-square-text nav-icon"),
+                              html.Div("AdaptivIQ", className="nav-label")],
+                             id="nav-chat", n_clicks=0, className="nav-item"))
+        )
+        nav_cols.append(dbc.Col(html.Div(id="nav-squad", n_clicks=0, style={"display": "none"}), style={"display": "none"}))
+    if is_coach:
+        nav_cols.append(dbc.Col(html.Div(id="nav-chat", n_clicks=0, style={"display": "none"}), style={"display": "none"}))
 
     bottom_nav = html.Div(
         [
@@ -5623,6 +5714,7 @@ def build_main_layout(auth_data):
             graphs_view,
             ai_view,
             squad_view,
+            chat_view,
             session_log_modal,
             bottom_nav,
         ],
@@ -5893,6 +5985,8 @@ def do_login(n_clicks, username, password):
         role = str(info.get("role", "athlete")).lower()
         sheet = info.get("sheet", "")
         if username.strip().lower() == u and password.strip() == p:
+            flask_session["adtv_user"] = {"sheet": sheet, "name": athlete_key,
+                                          "role": role, "at": time.time()}
             return ({"authed": True, "username": username.strip(),
                      "athlete_name": athlete_key, "athlete_sheet": sheet,
                      "is_coach": (role == "coach")}, "")
@@ -5908,6 +6002,7 @@ def do_login(n_clicks, username, password):
 def logout(n):
     if not n:
         raise PreventUpdate
+    flask_session.pop("adtv_user", None)
     return {"authed": False}
 
 
@@ -6503,8 +6598,7 @@ def populate_session_context(selected_date, athlete_name):
     Input("btn-generate-ai", "n_clicks"),
     [State("athlete-dropdown", "value"),
      State("selected-date-store", "data"),
-     State("ai-mode-1", "value"),
-     State("ai-mode-2", "value"),
+     State("lens-pick", "data"),
      State("athlete-notes", "value"),
      State("sets-reps-load", "value"),
      State("track-reps-times", "value"),
@@ -6520,13 +6614,16 @@ def populate_session_context(selected_date, athlete_name):
 )
 def save_and_ai(
         n_clicks, athlete_name, selected_date,
-        ai_mode_1, ai_mode_2,
+        lens_pick,
         notes, sets_reps_load, track_reps_times,
         unplanned_workout, unplanned_focus, unplanned_venue,
         unplanned_key_distance, unplanned_duration, unplanned_srpe,
         session_inputs,
         refresh_n,
 ):
+    lens_pick = lens_pick or {}
+    ai_mode_1 = lens_pick.get("l1") if lens_pick.get("l1") in LENS_INFO else None
+    ai_mode_2 = lens_pick.get("l2") if lens_pick.get("l2") in LENS_INFO else None
     # Effort, quality and wellness now come from the tap rows (one store).
     si = session_inputs or {}
     rpe = si.get("rpe")
@@ -6740,50 +6837,11 @@ def reset_inputs(n):
     return {}, "", "", ""
 
 
-app.clientside_callback(
-    """
-    function(val1, val2) {
-        function styleRadioPills(containerSelector) {
-            var labels = document.querySelectorAll(containerSelector + ' .coach-radio-label');
-            var inputs = document.querySelectorAll(containerSelector + ' .coach-radio-input');
-            labels.forEach(function(lbl, i) {
-                var inp = inputs[i];
-                var isChecked = inp && inp.checked;
-                lbl.style.background  = isChecked ? '#1E88E5' : '#f8f8f8';
-                lbl.style.borderColor = isChecked ? '#1E88E5' : '#d0d0d0';
-                lbl.style.color       = isChecked ? 'white'   : '#444';
-                lbl.style.fontWeight  = isChecked ? '600'     : 'normal';
-            });
-        }
-        setTimeout(function() {
-            styleRadioPills('#ai-mode-1');
-            styleRadioPills('#ai-mode-2');
-            document.querySelectorAll('.coach-radio').forEach(function(el) {
-                var inputs = el.querySelectorAll('.coach-radio-input');
-                var labels = el.querySelectorAll('.coach-radio-label');
-                inputs.forEach(function(inp, i) {
-                    if (labels[i]) {
-                        labels[i].style.background  = inp.checked ? '#1E88E5' : '#f8f8f8';
-                        labels[i].style.borderColor = inp.checked ? '#1E88E5' : '#d0d0d0';
-                        labels[i].style.color       = inp.checked ? 'white'   : '#444';
-                        labels[i].style.fontWeight  = inp.checked ? '600'     : 'normal';
-                    }
-                });
-            });
-        }, 50);
-        return window.dash_clientside.no_update;
-    }
-    """,
-    Output("active-tab-store", "data", allow_duplicate=True),
-    Input("ai-mode-1", "value"),
-    Input("ai-mode-2", "value"),
-    prevent_initial_call=True,
-)
 
 app.clientside_callback(
     """
     function(activeTab){
-        const tabs = ["home", "calendar", "graphs", "ai", "squad"];
+        const tabs = ["home", "calendar", "graphs", "ai", "squad", "chat"];
         tabs.forEach(t => {
             const nav  = document.getElementById("nav-"  + t);
             const icon = document.getElementById("icon-" + t);
@@ -9837,14 +9895,14 @@ def debug_dashboard(tab_name):
 # ============================================================
 app.clientside_callback(
     """
-    function(h, c, g, a, s, storeTab) {
+    function(h, c, g, a, s, ch, storeTab) {
         var ctx = dash_clientside.callback_context;
         var tab = storeTab || "home";
         if (ctx.triggered && ctx.triggered.length) {
             var id = ctx.triggered[0].prop_id.split(".")[0];
             if (id !== "bottom-nav-click" && id.indexOf("nav-") === 0) { tab = id.replace("nav-", ""); }
         }
-        var keys = ["home", "calendar", "graphs", "ai", "squad"];
+        var keys = ["home", "calendar", "graphs", "ai", "squad", "chat"];
         var out = keys.map(function(k){ return {display: k === tab ? "block" : "none"}; });
         out.push(tab);
         return out;
@@ -9855,12 +9913,14 @@ app.clientside_callback(
      Output("graphs-view", "style"),
      Output("ai-view", "style"),
      Output("squad-view", "style"),
+     Output("chat-view", "style"),
      Output("bottom-nav-click", "data")],
     [Input("nav-home", "n_clicks"),
      Input("nav-calendar", "n_clicks"),
      Input("nav-graphs", "n_clicks"),
      Input("nav-ai", "n_clicks"),
      Input("nav-squad", "n_clicks"),
+     Input("nav-chat", "n_clicks"),
      Input("bottom-nav-click", "data")],
 )
 
@@ -10867,6 +10927,699 @@ $("pvtOnlyBtn").onclick = async () => {
 </body></html>
 """
 
+
+
+
+# ============================================================
+#  FEEDBACK PICKER — smart pick, one tap
+#  The app pre-picks two feedback lenses from today's plan, what the
+#  athlete wrote and their check-in, explains why, and lets them change
+#  it by choosing plain-language questions. Values are the same five
+#  lens names as before, so saved data and prompts are unchanged.
+# ============================================================
+
+LENSES = [
+    # value, short name, title, scientific descriptor, icon (Bootstrap Icons), colour
+    ("Acceleration & Speed Coach", "Speed", "Acceleration & Speed",
+     "Rep times as % of PB · speed maintenance across reps · rest-to-work density", "lightning-charge", "#2f80ed"),
+    ("Tempo & Endurance Coach", "Tempo", "Tempo & Speed Endurance",
+     "Running volume · session RPE relative to load · tempo density and pacing", "heart-pulse", "#14b8a6"),
+    ("Technical Sprint Coach", "Mechanics", "Technical Sprint Mechanics",
+     "Posture, projection, ground contact and arm action · acceleration-to-max-velocity transition",
+     "rulers", "#f5a524"),
+    ("Strength & Power Coach", "Strength", "Strength & Power",
+     "Estimated 1RM vs PB · load progression · jump and plyometric output", "graph-up-arrow", "#e91e8c"),
+    ("Recovery & Readiness Coach", "Recovery", "Recovery & Readiness",
+     "Sleep, fatigue and soreness vs your 28-day baseline · acute:chronic load", "moon-stars", "#2fb344"),
+]
+LENS_INFO = {v: {"short": sh, "q": q, "sub": sub, "icon": ic, "col": col} for v, sh, q, sub, ic, col in LENSES}
+
+# What the coach's plan says about the session (Focus / Workout / Key_Distance).
+_PLAN_LENS_WORDS = {
+    "Acceleration & Speed Coach": ["accel", "speed", "max v", "velocity", "block", "fly", "flying", "3pt",
+                                   "sled", "sprint", "start"],
+    "Tempo & Endurance Coach": ["tempo", "aerobic", "endurance", "capacity", "speed endurance", "special endurance",
+                                "conditioning", "circuit", "curve", "lactate", "extensive", "intensive"],
+    "Technical Sprint Coach": ["technical", "technique", "drill", "hurdle", "mechanics", "wicket", "run thru",
+                               "run-thru", "skip"],
+    "Strength & Power Coach": ["gym", "strength", "power", "lower body", "upper body", "plyo", "jump", "bound",
+                               "lift", "weights"],
+    "Recovery & Readiness Coach": ["recovery", "rest", "regen", "mobility", "walk", "pool", "massage"],
+}
+
+
+_GENERIC_WORDS = {"reps", "sets", "form", "rhythm", "power", "gym", "speed", "sprint", "sprints"}
+_EXTRA_ATHLETE_WORDS = {
+    "Recovery & Readiness Coach": ["hamstring", "calf", "achilles", "pain", "sick", "ill", "stiff", "heavy legs",
+                                   "flat", "exhausted", "cramp", "injur"],
+    "Technical Sprint Coach": ["arms", "posture", "foot strike", "front side", "backside", "overstrid"],
+    "Acceleration & Speed Coach": ["fast", "quick", "pb", "personal best", "slow", "time"],
+    "Strength & Power Coach": ["heavy", "lift", "kg", "1rm", "bar"],
+}
+
+
+def lens_history(df: pd.DataFrame, today: dt.date, days: int = 120) -> dict:
+    """How often each lens has been used in the athlete's recent feedback ('[lens] text' in AI_Suggestion_1/2)."""
+    counts = {v: 0 for v in LENS_INFO}
+    if df is None or df.empty or "Date" not in df.columns:
+        return counts
+    d = df.copy()
+    d["_d"] = pd.to_datetime(d["Date"], errors="coerce").dt.date
+    d = d[(d["_d"] <= today) & (d["_d"] >= today - dt.timedelta(days=days))]
+    for col in ("AI_Suggestion_1", "AI_Suggestion_2"):
+        if col not in d.columns:
+            continue
+        for txt in d[col].tolist():
+            m = re.match(r"\s*\[([^\]]+)\]", str(txt or ""))
+            if m and m.group(1).strip() in counts:
+                counts[m.group(1).strip()] += 1
+    return counts
+
+
+def smart_lens_pick(df: pd.DataFrame, day: dt.date, notes: str = "", gym: str = "", track: str = "") -> dict:
+    """
+    Two lenses for today plus a one-line reason. Today's session matters most
+    (the plan, then what the athlete wrote), then the check-in, then what the
+    athlete has asked for before.
+    """
+    score = {v: 0.0 for v in LENS_INFO}
+    why = {v: [] for v in LENS_INFO}
+    row = None
+    if df is not None and not df.empty and "Date" in df.columns:
+        d = df.copy()
+        d["_d"] = pd.to_datetime(d["Date"], errors="coerce").dt.date
+        hit = d[d["_d"] == day]
+        row = hit.iloc[-1] if not hit.empty else None
+
+    # 1. The coach's plan for the day
+    if row is not None:
+        focus = str(row.get("Focus", "") or "").strip()
+        plan = " ".join(str(row.get(c, "") or "") for c in ("Focus", "Workout", "Key_Distance")).lower()
+        for v, words in _PLAN_LENS_WORDS.items():
+            n = sum(1 for w in words if w in plan)
+            if n:
+                score[v] += 3.0 + min(n, 3)
+                why[v].append(f"today's plan is <b>{html_escape(focus) if focus else 'this session'}</b>")
+        if str(gym or "").strip() or str(row.get("Sets_Reps_Load", "") or "").strip():
+            score["Strength & Power Coach"] += 1.5
+
+    # 2. What the athlete wrote (generic words like "reps" or "sets" don't count)
+    words_txt = " ".join([str(notes or ""), str(gym or ""), str(track or "")]).lower()
+    for v, kws in PERSONA_KEYWORDS.items():
+        kws = [k for k in kws if k not in _GENERIC_WORDS] + _EXTRA_ATHLETE_WORDS.get(v, [])
+        found = sorted((k for k in kws if re.search(r"\b" + re.escape(k), words_txt)),
+                       key=lambda k: re.search(r"\b" + re.escape(k), words_txt).start())
+        if found:
+            score[v] += 2.0 * min(len(found), 2)
+            if v == "Recovery & Readiness Coach" or str(notes or "").lower().find(found[0]) >= 0:
+                why[v].append(f"you mentioned <b>{html_escape(found[0])}</b>")
+    if parse_track_reps(track):
+        score["Acceleration & Speed Coach"] += 1.5
+
+    # 3. Today's check-in against the athlete's usual
+    if row is not None and df is not None:
+        try:
+            hist = d[(d["_d"] < day) & (d["_d"] >= day - dt.timedelta(days=28))]
+            for col, label, worse_high in (("Sleep_1_5", "sleep", False), ("Soreness_1_5", "soreness", True),
+                                           ("Fatigue_1_5", "energy", False)):
+                if col not in d.columns:
+                    continue
+                today_v = pd.to_numeric(row.get(col), errors="coerce")
+                usual = pd.to_numeric(hist[col], errors="coerce").dropna()
+                if pd.isna(today_v) or len(usual) < 5:
+                    continue
+                off = (today_v - usual.mean()) * (1 if worse_high else -1)
+                if off >= 1:
+                    score["Recovery & Readiness Coach"] += 2.5
+                    why["Recovery & Readiness Coach"].append(
+                        f"your <b>{label}</b> is {'higher' if worse_high else 'lower'} than usual")
+        except Exception:
+            pass
+
+    # 4. What they usually ask for (a light nudge, so today's session still leads)
+    counts = lens_history(df, day)
+    total = sum(counts.values())
+    if total:
+        for v, c in counts.items():
+            score[v] += 1.5 * c / total
+
+    order = sorted(score, key=lambda v: (-score[v], [l[0] for l in LENSES].index(v)))
+    l1 = order[0] if score[order[0]] > 0 else "Acceleration & Speed Coach"
+    l2 = next((v for v in order if v != l1 and score[v] > 0), None) or (
+        "Recovery & Readiness Coach" if l1 != "Recovery & Readiness Coach" else "Acceleration & Speed Coach")
+
+    reasons = (why[l1][:1] + why[l2][:1])
+    if not reasons and total:
+        fav = max(counts, key=counts.get)
+        reasons = [f"you often ask for <b>{LENS_INFO[fav]['short'].lower()}</b> feedback"]
+    text = ("Picked because " + " and ".join(reasons) + ".") if reasons else \
+        "Picked from today's session. Change it if you want a different view."
+    return {"l1": l1, "l2": l2, "why": text, "counts": counts}
+
+
+def _lens_question(v):
+    info = LENS_INFO[v]
+    return html.Button([
+        html.Span(html.I(className=f"bi bi-{info['icon']}"), className="lq-ic",
+                  style={"color": info["col"], "background": info["col"] + "22"}),
+        html.Span([html.Span(info["q"], className="lq-t"), html.Span(info["sub"], className="lq-s")]),
+        html.Span("", className="lq-n", id={"type": "lens-q-n", "v": v}),
+    ], id={"type": "lens-q", "v": v}, n_clicks=0, className="lens-q")
+
+
+def lens_picker_layout():
+    return html.Div([
+        dcc.Store(id="lens-pick", data={"l1": None, "l2": None, "manual": False}),
+        html.Div("Your feedback today", className="lens-head"),
+        html.Div([html.Span([html.I(id="lens-chip-1-ic"), html.Span(id="lens-chip-1-tx")],
+                            id="lens-chip-1", className="lens-chip"),
+                  html.Span([html.I(id="lens-chip-2-ic"), html.Span(id="lens-chip-2-tx")],
+                            id="lens-chip-2", className="lens-chip")], className="lens-chips"),
+        dcc.Markdown(id="lens-why", className="lens-why", dangerously_allow_html=True),
+        html.Button("Change ›", id="lens-change-btn", n_clicks=0, className="lens-change"),
+        html.Div([
+            html.Div("Based on the notes you've entered today, what would you like feedback on? "
+                     "Pick up to two — your first pick leads.", className="lens-hint"),
+            *[_lens_question(v) for v, *_ in LENSES],
+            html.Div(id="lens-hist", className="lens-hist"),
+        ], id="lens-panel", className="lens-panel", style={"display": "none"}),
+    ], className="lens-card", style={"marginBottom": "4px"})
+
+
+@app.callback(
+    Output("lens-pick", "data"),
+    Output("lens-why", "children"),
+    Output("lens-hist", "children"),
+    Input("selected-date-store", "data"),
+    Input("athlete-dropdown", "value"),
+    Input("athlete-notes", "n_blur"),
+    Input("sets-reps-load", "n_blur"),
+    Input("track-reps-times", "n_blur"),
+    State("athlete-notes", "value"),
+    State("sets-reps-load", "value"),
+    State("track-reps-times", "value"),
+    State("lens-pick", "data"),
+)
+def update_smart_lens(selected_date, athlete_id, _b1, _b2, _b3, notes, gym, track, current):
+    if not athlete_id:
+        raise PreventUpdate
+    trig = callback_context.triggered_id
+    new_day = trig in ("selected-date-store", "athlete-dropdown")
+    try:
+        day = pd.to_datetime(selected_date).date() if selected_date else today_adl()
+    except Exception:
+        day = today_adl()
+    try:
+        df = load_tab_cached(athlete_id)
+    except Exception:
+        df = pd.DataFrame()
+    pick = smart_lens_pick(df, day, notes, gym, track)
+    counts = pick["counts"]
+    total = sum(counts.values())
+    hist = []
+    if total:
+        hist.append(html.Div("Feedback you've had recently", className="lens-hint", style={"marginTop": "4px"}))
+        top = max(counts.values()) or 1
+        for v, *_ in LENSES:
+            info = LENS_INFO[v]
+            hist.append(html.Div([
+                html.Span(info["short"], className="lh-l"),
+                html.Span(className="lh-b", style={"width": f"{max(3, 150 * counts[v] / top):.0f}px",
+                                                    "background": info["col"]}),
+                html.Span(str(counts[v]), className="lh-n"),
+            ], className="lens-hist-row"))
+    current = current or {}
+    if current.get("manual") and not new_day:
+        # The athlete chose for themselves: keep their choice, just refresh the history.
+        return no_update, "Your choice for today.", hist
+    return {"l1": pick["l1"], "l2": pick["l2"], "manual": False}, pick["why"], hist
+
+
+# Tap a question: first pick leads, second pick adds a second view; tapping a pick removes it.
+app.clientside_callback(
+    """
+    function(clicks, cur){
+        const ctx = window.dash_clientside.callback_context;
+        if(!ctx.triggered.length || !ctx.triggered[0].value){ return window.dash_clientside.no_update; }
+        const id = JSON.parse(ctx.triggered[0].prop_id.split('.')[0]);
+        const v = id.v;
+        cur = Object.assign({l1: null, l2: null}, cur || {});
+        let l1 = cur.l1, l2 = cur.l2;
+        if(v === l1){ l1 = l2; l2 = null; }
+        else if(v === l2){ l2 = null; }
+        else if(!l1){ l1 = v; }
+        else { l2 = v; }
+        return {l1: l1, l2: l2, manual: true};
+    }
+    """,
+    Output("lens-pick", "data", allow_duplicate=True),
+    Input({"type": "lens-q", "v": ALL}, "n_clicks"),
+    State("lens-pick", "data"),
+    prevent_initial_call=True,
+)
+
+# Draw the chips and the numbered questions from the current pick (instant, on the phone).
+app.clientside_callback(
+    """
+    function(pick, ids){
+        const INFO = %s;
+        pick = pick || {};
+        function chip(v, n){
+            if(!v || !INFO[v]){
+                if(n === 2 && pick.l1) return ["", "＋ 2nd picked for you", {display: "inline-flex", color: "var(--text-muted)",
+                                                background: "transparent", border: "1px dashed var(--border)"}];
+                return ["", "", {display: "none"}];
+            }
+            const i = INFO[v];
+            return ["bi bi-" + i.icon, i.short + (n === 2 ? " · 2nd" : ""),
+                    {display: "inline-flex", color: i.col, background: i.col + "22", border: "1px solid " + i.col + "66"}];
+        }
+        const c1 = chip(pick.l1, 1), c2 = chip(pick.l2, 2);
+        const cls = ids.map(id => id.v === pick.l1 ? "lens-q pick1" : (id.v === pick.l2 ? "lens-q pick2" : "lens-q"));
+        const nums = ids.map(id => id.v === pick.l1 ? "1" : (id.v === pick.l2 ? "2" : ""));
+        return [c1[0], c1[1], c1[2], c2[0], c2[1], c2[2], cls, nums];
+    }
+    """ % json.dumps({v: {"short": i["short"], "icon": i["icon"], "col": i["col"]} for v, i in LENS_INFO.items()}),
+    Output("lens-chip-1-ic", "className"),
+    Output("lens-chip-1-tx", "children"),
+    Output("lens-chip-1", "style"),
+    Output("lens-chip-2-ic", "className"),
+    Output("lens-chip-2-tx", "children"),
+    Output("lens-chip-2", "style"),
+    Output({"type": "lens-q", "v": ALL}, "className"),
+    Output({"type": "lens-q-n", "v": ALL}, "children"),
+    Input("lens-pick", "data"),
+    State({"type": "lens-q", "v": ALL}, "id"),
+)
+
+# Once the athlete chooses for themselves, say so instead of the app's reason.
+app.clientside_callback(
+    """
+    function(pick){
+        if(pick && pick.manual){ return "Your choice for today."; }
+        return window.dash_clientside.no_update;
+    }
+    """,
+    Output("lens-why", "children", allow_duplicate=True),
+    Input("lens-pick", "data"),
+    prevent_initial_call=True,
+)
+
+# Show / hide the question list.
+app.clientside_callback(
+    """
+    function(n){
+        const open = (n || 0) % 2 === 1;
+        return [{display: open ? "flex" : "none"}, open ? "Done ›" : "Change ›"];
+    }
+    """,
+    Output("lens-panel", "style"),
+    Output("lens-change-btn", "children"),
+    Input("lens-change-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+
+
+
+# ============================================================
+#  AdaptivIQ — ask-anything chat for athletes, answered from their own data
+#  * Who is asking comes from the signed server session set at login, never
+#    from the browser, so an athlete can only ever ask about their own tab.
+#  * Claude gets a compact summary the app has already calculated (recent
+#    sessions, usual ranges, PBs, lifts, plan), not the raw sheet.
+#  * Every question and answer is saved to a "Chats" tab for the coach.
+# ============================================================
+
+CHAT_TAB = "Chats"
+CHAT_HEADERS = ["Athlete", "Date", "Logged_At", "Question", "Answer"]
+CHAT_DAILY_LIMIT = int(os.getenv("CHAT_DAILY_LIMIT", "30"))
+_chat_counts = {}          # (athlete, date) -> questions asked today (per server process)
+
+CHAT_STARTERS = [
+    "Why is my readiness where it is today?",
+    "How has my training load changed this month?",
+    "What are my PBs and how close have I been lately?",
+    "What's coming up this week?",
+    "How has my sleep been compared with usual?",
+]
+
+
+def chat_view_layout():
+    return html.Div(id="chat-view", style={"display": "none"}, children=[
+        dcc.Store(id="chat-history", data=[], storage_type="session"),
+        dcc.Store(id="chat-pending"),
+        html.H2("AdaptivIQ", className="chat-title"),
+        html.P("Ask about your training, readiness, PBs or what's coming up. Answers come from your own "
+               "ADPTVV data.", className="chat-sub"),
+        html.Div([
+            html.I(className="bi bi-database-check"),
+            html.Span("AdaptivIQ looks at: your last 6 weeks of sessions and notes · check-ins vs your usual · "
+                      "training load · PBs, track reps and lifts · Eye Checks · your next 7 days of training"),
+        ], className="chat-context"),
+        html.Div(id="chat-chips", className="chat-chips", children=[
+            html.Button(q, id={"type": "chat-chip", "i": k}, n_clicks=0, className="chat-chip")
+            for k, q in enumerate(CHAT_STARTERS)]),
+        html.Div(id="chat-log", className="chat-log"),
+        html.Div([
+            html.Div([html.I(className="bi bi-stars"), "AdaptivIQ"], className="chat-who"),
+            html.Div([
+                html.Div(html.Div(className="chat-ekg-line"), className="chat-ekg"),
+                html.Div([
+                    html.Span("Reading your recent sessions…"),
+                    html.Span("Comparing with your usual…"),
+                    html.Span("Writing your answer…"),
+                ], className="chat-think-txt"),
+            ], className="chat-think-row"),
+        ], id="chat-thinking", className="chat-msg chat-ai chat-thinking", style={"display": "none"}),
+        html.Div(id="chat-typing", className="chat-typing"),
+        html.Button("Clear chat", id="chat-clear", n_clicks=0, className="chat-clear"),
+        html.Div("Questions and answers are saved so your coach can see them. It's a training guide, not "
+                 "medical advice — talk to your coach or physio about pain or injury.", className="chat-note"),
+        html.Div(html.Div([
+            dcc.Input(id="chat-input", type="text", placeholder="Ask AdaptivIQ…", debounce=False,
+                      autoComplete="off", n_submit=0),
+            html.Button(html.I(className="bi bi-arrow-up"), id="chat-send", n_clicks=0, title="Send"),
+        ], className="chat-bar-in"), className="chat-bar"),
+    ])
+
+
+def _chat_fmt(v, nd=1):
+    try:
+        f = float(v)
+        return f"{f:.{nd}f}".rstrip("0").rstrip(".")
+    except (TypeError, ValueError):
+        return str(v or "").strip()
+
+
+def build_chat_context(athlete: str) -> str:
+    """Everything AdaptivIQ may use, as plain text. Numbers are worked out here, not by the AI."""
+    today = today_adl()
+    first = athlete.split()[0] if athlete else "the athlete"
+    lines = [f"ATHLETE: {athlete} (call them {first}). TODAY: {today:%A %d %B %Y}."]
+    try:
+        df = load_tab_cached(athlete)
+    except Exception:
+        df = pd.DataFrame()
+    if df is None or df.empty:
+        return "\n".join(lines + ["No training data found."])
+    d = with_reps_from_notes(df).copy()
+    d["_d"] = pd.to_datetime(d["Date"], errors="coerce").dt.date
+    d = d.dropna(subset=["_d"]).sort_values("_d")
+
+    # Today's state, compared with their usual
+    try:
+        neuro = compute_neuro_for_athlete(df, today, athlete)
+        drivers = compute_drivers(df, today, athlete=athlete)
+        lines.append("\nTODAY VS USUAL (28-day baseline):")
+        if neuro is not None:
+            lines.append(f"- Neuromuscular readiness dial: {neuro:.0f}/100")
+        for r in drivers:
+            lines.append(f"- {r['label']}: {r['status']} ({r['detail']})")
+    except Exception as e:
+        print(f"⚠️ chat drivers: {e}")
+
+    # Weekly load
+    try:
+        w = d[(d["_d"] <= today) & (d["_d"] > today - dt.timedelta(days=56))].copy()
+        w["Load"] = pd.to_numeric(w.get("Load"), errors="coerce")
+        w["_wk"] = w["_d"].apply(lambda x: x - dt.timedelta(days=x.weekday()))
+        wk = w.groupby("_wk")["Load"].sum()
+        if not wk.empty:
+            lines.append("\nWEEKLY TRAINING LOAD (sRPE x minutes, week starting Monday):")
+            lines += [f"- {k:%d %b}: {v:.0f}" for k, v in wk.items()]
+    except Exception:
+        pass
+
+    # Recent sessions
+    recent = d[(d["_d"] <= today) & (d["_d"] > today - dt.timedelta(days=42))]
+    cols = {"Workout": 110, "Focus": 30, "RPE_Post_Session": 4, "Session_1_5": 4, "Sleep_1_5": 4,
+            "Fatigue_1_5": 4, "Soreness_1_5": 4, "Mood_1_5": 4, "Track_Reps_Times": 120,
+            "Sets_Reps_Load": 140, "Athlete_Notes": 160}
+    rows = []
+    for _, r in recent.iterrows():
+        bits = []
+        for c, lim in cols.items():
+            v = str(r.get(c, "") or "").strip()
+            if v and v.lower() not in ("nan", "none"):
+                bits.append(f"{c}={v.replace(chr(10), ' ')[:lim]}")
+        if len(bits) > 1:
+            rows.append(f"- {r['_d']:%a %d %b}: " + "; ".join(bits))
+    if rows:
+        lines.append("\nLAST 6 WEEKS OF SESSIONS (RPE_Post_Session and wellness on 1-5 scales; "
+                     "Fatigue_1_5 is energy, higher = better; Soreness higher = more sore):")
+        lines += rows[-40:]
+
+    # Plan for the next 7 days
+    ahead = d[(d["_d"] > today) & (d["_d"] <= today + dt.timedelta(days=7))]
+    plan = [f"- {r['_d']:%a %d %b}: {str(r.get('Focus', '') or '').strip()} | "
+            f"{str(r.get('Workout', '') or '').strip()[:160]} | planned sRPE {_chat_fmt(r.get('sRPE'))}"
+            for _, r in ahead.iterrows() if str(r.get("Workout", "") or "").strip()]
+    if plan:
+        lines.append("\nPLAN FOR THE NEXT 7 DAYS:")
+        lines += plan
+
+    # PBs, track history and lifts
+    try:
+        pbs = current_pbs(athlete)
+        if pbs:
+            lines.append("\nPERSONAL BESTS:")
+            for ev, p in pbs.items():
+                if p.get("type") == "Track":
+                    parts = []
+                    for k in ("train", "comp"):
+                        if p.get(k):
+                            parts.append(f"{'training' if k == 'train' else 'competition'} "
+                                         f"{fmt_time(p[k]['value'])}s ({p[k].get('date', '')})")
+                    lines.append(f"- {ev}: " + ("; ".join(parts) or f"{fmt_time(p['value'])}s"))
+                else:
+                    est = f", est. 1RM {p['est_1rm']:.0f}kg" if p.get("est_1rm") else ""
+                    lines.append(f"- {ev}: {p['value']:g}{p.get('unit') or 'kg'} x {p.get('reps', 1)}{est} ({p.get('date', '')})")
+    except Exception as e:
+        print(f"⚠️ chat PBs: {e}")
+    try:
+        sq = sprint_quality_history(df, athlete)
+        if sq:
+            lines.append("\nTRACK REPS BY DISTANCE (best rep per session, % of PB or best so far):")
+            for ev, hist in sq.items():
+                last = hist[-6:]
+                lines.append(f"- {ev}: " + ", ".join(f"{h['date']:%d %b} {fmt_time(h['best'])}s "
+                                                     f"({h['best_pct']:.0f}%)" for h in last))
+    except Exception as e:
+        print(f"⚠️ chat track: {e}")
+    try:
+        gh = gym_session_history(df, athlete)
+        if gh:
+            lines.append("\nGYM TOP SETS (estimated 1RM):")
+            for ex, hist in gh.items():
+                last = hist[-5:]
+                lines.append(f"- {ex}: " + ", ".join(f"{h['date']:%d %b} {h['load']:g}kg x {h['reps']} "
+                                                     f"(~{h['est']:.0f})" for h in last))
+    except Exception as e:
+        print(f"⚠️ chat gym: {e}")
+    try:
+        if athlete in _eye_athletes():
+            er = load_eye_rows(athlete)
+            if not er.empty:
+                lines.append("\nEYE CHECKS (latest 5):")
+                for _, r in er.tail(5).iterrows():
+                    lines.append(f"- {r.get('Date', '')}: blink rate {r.get('Blink_Rate', '')}/min, "
+                                 f"reaction {r.get('PVT3_Median_ms', '')} ms, lapses {r.get('PVT3_Lapses', '')}")
+    except Exception:
+        pass
+    return "\n".join(lines)
+
+
+CHAT_SYSTEM = """You are AdaptivIQ, the in-app assistant in ADPTVV, a training app for track and field athletes.
+You are talking with {first}, an athlete. Answer their question using ONLY the DATA below, which comes from
+their own training log and has already been calculated by the app.
+
+Rules:
+- Use the athlete's real numbers and dates from the DATA. Never invent sessions, times, loads or scores.
+- If the DATA doesn't contain what's needed, say so plainly and suggest what to log or who to ask.
+- Keep it short: 2-5 sentences, or a short list, unless they ask for detail. Plain language, Australian spelling.
+  No headings. Use the athlete's first name at most once.
+- You are not a doctor or physio. Never diagnose. If they mention pain, injury, illness or feeling unwell,
+  say to tell their coach or physio today, and don't suggest training through it.
+- Don't change their program. Frame any suggestion about training as something to check with their coach.
+- Talk about training, recovery, readiness, PBs and their plan. Politely decline unrelated requests.
+- Wellness scales are 1-5. Readiness and load are guides, not verdicts.
+
+DATA:
+{data}"""
+
+
+def _chat_ws(create=False):
+    if sh is None:
+        return None
+    try:
+        return sh.worksheet(CHAT_TAB)
+    except gspread.WorksheetNotFound:
+        if not create:
+            return None
+        ws = sh.add_worksheet(title=CHAT_TAB, rows=2000, cols=len(CHAT_HEADERS))
+        ws.append_row(CHAT_HEADERS, value_input_option="USER_ENTERED")
+        return ws
+
+
+def _chat_log_save(athlete, question, answer):
+    try:
+        ws = _chat_ws(create=True)
+        if ws is not None:
+            now = dt.datetime.now(ADL_TZ)
+            safe = lambda t: ("'" + t) if str(t)[:1] in ("=", "+", "-", "@") else str(t)
+            ws.append_row([athlete, str(now.date()), now.strftime("%Y-%m-%d %H:%M"),
+                           safe(question)[:2000], safe(answer)[:4000]], value_input_option="USER_ENTERED")
+    except Exception as e:
+        print(f"⚠️ chat log save failed: {e}")
+
+
+def answer_chat(athlete: str, question: str, history: list) -> str:
+    first = athlete.split()[0] if athlete else "there"
+    system = CHAT_SYSTEM.format(first=first, data=build_chat_context(athlete))
+    msgs = [{"role": "system", "content": system}]
+    for m in (history or [])[-8:]:
+        if m.get("role") in ("user", "assistant") and m.get("text"):
+            msgs.append({"role": m["role"], "content": str(m["text"])[:1500]})
+    msgs.append({"role": "user", "content": question[:800]})
+    reply = call_claude_chat(msgs, max_tokens=600)
+    reply = (reply or "").strip()
+    if not reply or "unavailable" in reply.lower():
+        return "Sorry, I can't answer right now. Please try again in a minute."
+    return reply
+
+
+def _chat_user():
+    u = flask_session.get("adtv_user") or {}
+    if not u.get("sheet") or str(u.get("role", "athlete")).lower() == "coach":
+        return None
+    return u
+
+
+# 1. Send: show the question straight away (on the phone), then ask the server.
+app.clientside_callback(
+    """
+    function(nSend, nSubmit, chipClicks, text, history){
+        const ctx = window.dash_clientside.callback_context;
+        const nu = window.dash_clientside.no_update;
+        if(!ctx.triggered.length || !ctx.triggered[0].value){ return [nu, nu, nu]; }
+        let q = (text || "").trim();
+        const pid = ctx.triggered[0].prop_id;
+        if(pid.indexOf("chat-chip") >= 0){
+            const id = JSON.parse(pid.split(".")[0]);
+            const chip = document.getElementById(JSON.stringify(id)) ||
+                         document.querySelectorAll(".chat-chip")[id.i];
+            q = chip ? chip.innerText.trim() : q;
+        }
+        if(!q){ return [nu, nu, nu]; }
+        const prev = history || [];
+        if(prev.length && prev[prev.length - 1].role === "user"){ return [nu, nu, nu]; }  // still answering
+        const h = prev.concat([{role: "user", text: q}]);
+        return [h, "", {q: q, t: Date.now()}];
+    }
+    """,
+    Output("chat-history", "data", allow_duplicate=True),
+    Output("chat-input", "value"),
+    Output("chat-pending", "data"),
+    Input("chat-send", "n_clicks"),
+    Input("chat-input", "n_submit"),
+    Input({"type": "chat-chip", "i": ALL}, "n_clicks"),
+    State("chat-input", "value"),
+    State("chat-history", "data"),
+    prevent_initial_call=True,
+)
+
+
+# 2. Answer on the server, for the athlete in the signed session only.
+@app.callback(
+    Output("chat-history", "data", allow_duplicate=True),
+    Output("chat-typing", "children"),
+    Input("chat-pending", "data"),
+    State("chat-history", "data"),
+    prevent_initial_call=True,
+)
+def chat_reply(pending, history):
+    if not pending or not pending.get("q"):
+        raise PreventUpdate
+    history = list(history or [])
+    user = _chat_user()
+    if not user:
+        history.append({"role": "assistant", "text": "Please log out and log back in to use AdaptivIQ."})
+        return history, ""
+    athlete = user["sheet"]
+    key = (athlete, str(today_adl()))
+    if _chat_counts.get(key, 0) >= CHAT_DAILY_LIMIT:
+        history.append({"role": "assistant",
+                        "text": f"You've reached today's limit of {CHAT_DAILY_LIMIT} questions. Ask again tomorrow."})
+        return history, ""
+    _chat_counts[key] = _chat_counts.get(key, 0) + 1
+    q = str(pending["q"])
+    prior = history[:-1] if history and history[-1].get("role") == "user" else history
+    try:
+        ans = answer_chat(athlete, q, prior)
+    except Exception as e:
+        print(f"❌ chat failed for {athlete}: {e}")
+        ans = "Sorry, something went wrong. Please try again."
+    history.append({"role": "assistant", "text": ans,
+                    "basis": f"Based on your ADPTVV log up to {today_adl().strftime('%d %b').lstrip('0')}"})
+    _threading.Thread(target=_chat_log_save, args=(athlete, q, ans), daemon=True).start()
+    return history, ""
+
+
+# 3. Draw the conversation.
+@app.callback(
+    Output("chat-log", "children"),
+    Output("chat-chips", "style"),
+    Input("chat-history", "data"),
+)
+def draw_chat(history):
+    history = history or []
+    out = []
+    for m in history:
+        if m.get("role") == "user":
+            out.append(html.Div(m.get("text", ""), className="chat-msg chat-me"))
+        else:
+            out.append(html.Div([
+                html.Div([html.I(className="bi bi-stars"), "AdaptivIQ"], className="chat-who"),
+                dcc.Markdown(m.get("text", ""), link_target="_blank"),
+                html.Div(m.get("basis", ""), className="chat-basis") if m.get("basis") else None,
+            ], className="chat-msg chat-ai"))
+    return out, ({"display": "none"} if history else {})
+
+
+app.clientside_callback(
+    """
+    function(n){ return n ? [] : window.dash_clientside.no_update; }
+    """,
+    Output("chat-history", "data", allow_duplicate=True),
+    Input("chat-clear", "n_clicks"),
+    prevent_initial_call=True,
+)
+
+# "Thinking" bubble with a heartbeat line while the answer is on its way.
+app.clientside_callback(
+    """
+    function(history){
+        const h = history || [];
+        const waiting = h.length && h[h.length - 1].role === "user";
+        return waiting ? {display: "block"} : {display: "none"};
+    }
+    """,
+    Output("chat-thinking", "style"),
+    Input("chat-history", "data"),
+)
+
+# Keep the newest message in view.
+app.clientside_callback(
+    """
+    function(children){
+        setTimeout(function(){ window.scrollTo({top: document.body.scrollHeight, behavior: "smooth"}); }, 60);
+        return window.dash_clientside.no_update;
+    }
+    """,
+    Output("chat-typing", "className"),
+    Input("chat-log", "children"),
+    prevent_initial_call=True,
+)
 
 
 if __name__ == "__main__":
