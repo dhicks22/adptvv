@@ -1378,27 +1378,37 @@ def build_upcoming_context(df: pd.DataFrame, anchor_date: dt.date, n: int = 5) -
 # the lens the coach picked instead of drifting into general wellness talk.
 PERSONA_LENS = {
     "Acceleration & Speed Coach": (
-        "FOCUS ONLY ON: the sprint and acceleration work — distances, rep times, % of PB, rest between reps "
-        "and sets, how speed held across reps, acceleration vs top-speed work, and quality of each effort.\n"
+        "CATEGORY: Acceleration & Speed.\n"
+        "FOCUS ONLY ON: rep times as % of PB, speed maintenance across reps (how the times held or dropped "
+        "from first to last rep), rest-to-work density (rest between reps and sets for the distance run), "
+        "acceleration vs top-speed work, and the quality of each effort.\n"
         "DO NOT COVER: gym loading, mobility, or general wellness trends (mention readiness in one short "
         "clause only if it changes how the speed work should be read)."),
     "Tempo & Endurance Coach": (
-        "FOCUS ONLY ON: tempo, conditioning and aerobic work — volumes, distances, effort vs load, RPE "
-        "relative to the session load, density and recovery between efforts.\n"
+        "CATEGORY: Tempo & Speed Endurance.\n"
+        "FOCUS ONLY ON: running volume (total metres, reps x distance), session RPE relative to the session "
+        "load, tempo density (recovery between efforts) and pacing (how evenly the reps were run).\n"
         "DO NOT COVER: sprint technique, block starts or gym loading."),
     "Technical Sprint Coach": (
-        "FOCUS ONLY ON: technique — 2 to 3 mechanical cues (posture, shin angle, first steps, arm action, "
-        "transition to upright running) tied to the drills and reps actually logged.\n"
+        "CATEGORY: Technical Sprint Mechanics.\n"
+        "FOCUS ONLY ON: 2 to 3 mechanical cues from posture, projection (body angle and push direction out of "
+        "the start and early acceleration), ground contact (where and how the foot meets the ground, staying "
+        "stiff and quick) and arm action, and the acceleration-to-max-velocity transition — tied to the drills, "
+        "distances and notes actually logged. These are coaching cues, not measurements: never claim to have "
+        "seen or measured angles or contact times.\n"
         "DO NOT COVER: training load, wellness scores, or gym loads."),
     "Strength & Power Coach": (
-        "FOCUS ONLY ON: strength and power — gym lifts with their sets, reps and loads, % of PB or 1RM, "
-        "plyometrics, jumps, hops and bounding, and how that work supports sprinting. If no gym work was "
-        "logged, talk about the power or plyometric elements in the logged workout (e.g. hops, bounds, "
-        "throws) and what strength work should support it next.\n"
+        "CATEGORY: Strength & Power.\n"
+        "FOCUS ONLY ON: estimated 1RM vs PB, load progression across recent sessions (sets, reps and loads "
+        "logged), and jump and plyometric output (hops, bounds, jumps, throws), and how that work supports "
+        "sprinting. If no gym work was logged, talk about the power or plyometric elements in the logged "
+        "workout and what strength work should support it next.\n"
         "DO NOT COVER: sleep or wellness trends, or sprint times as the main topic."),
     "Recovery & Readiness Coach": (
-        "FOCUS ONLY ON: recovery and readiness — the sleep, energy, soreness and mood scores logged, how "
-        "they compare with recent days, session RPE vs load, and concrete actions for the next 12-24 hours.\n"
+        "CATEGORY: Recovery & Readiness.\n"
+        "FOCUS ONLY ON: the sleep, energy, soreness and mood scores logged compared with the athlete's own "
+        "28-day baseline, session RPE vs load (acute:chronic load where it is in the data), and concrete "
+        "actions for the next 12-24 hours.\n"
         "DO NOT COVER: technique cues or gym programming."),
     "General": (
         "FOCUS ON: the one or two things in this session's data that matter most for the next session."),
@@ -1455,9 +1465,11 @@ def persona_prompt(mode: str) -> str:
         ),
         "Technical Sprint Coach": (
             "You are a sprint biomechanics coach in the style of Ralph Mann. "
-            "You think in joint angles, ground contact mechanics, force application, and phase-specific technique. "
-            "You focus on 2-3 specific technical cues per session — shin angle at contact, hip height, arm mechanics, "
+            "You think in posture, projection, ground contact mechanics, force application, and phase-specific technique. "
+            "You focus on 2-3 specific technical cues per session — posture, projection, ground contact, arm action, "
             "or the transition from acceleration to maximum velocity. "
+            "You never claim to have watched the session or measured angles or contact times — your cues come "
+            "from the drills, distances, times and notes logged. "
             "You always tie your cues to what the athlete actually did in the session logged. "
             "You never comment on training load or volume — mechanics is your domain. "
             "Your tone is precise, observational, and data-informed — like a coach analysing film frame by frame."
@@ -1580,7 +1592,7 @@ def verify_and_revise_insight(insight: str, session_block: str, coach_label: str
         "OK\n"
         "REVISE: <corrected message>\n"
         "The corrected message must keep the same coach voice and length, change only the unsupported "
-        "detail(s), still open with the athlete's first name, and be plain text. Output NOTHING else — "
+        "detail(s), keep the draft's opening words exactly (e.g. 'Based on your notes,'), and be plain text. Output NOTHING else — "
         "no reason, no explanation, no notes, no markdown."
     )
     check_user = f"SESSION DATA:\n{session_block}\n\nDRAFT ({coach_label}):\n{insight}"
@@ -1884,6 +1896,38 @@ CRAFT_FRAMING_RULES = (
 )
 
 
+def feedback_openers(notes, sets_reps_load, track_reps_times, session_rpe, session_quality,
+                     lens_1="", lens_2=""):
+    """The words each insight must start with, chosen from what the athlete entered and the lens used:
+    the Recovery lens reads the check-in and session ratings; the others read what the athlete wrote."""
+    def _has(v):
+        return str(v or "").strip().lower() not in ("", "none provided", "nan", "none")
+    wrote = any(_has(v) for v in (notes, sets_reps_load, track_reps_times))
+    rated = any(_has(v) for v in (session_rpe, session_quality))
+
+    def _one(lens):
+        if lens == "Recovery & Readiness Coach":
+            return "Based on your check-in and session feedback,"
+        if wrote:
+            return "Based on your notes,"
+        return "Based on your session feedback," if rated else "Based on today's session,"
+    return _one(lens_1), _one(lens_2)
+
+
+def ensure_opener(text: str, opener: str, first_name: str = "") -> str:
+    """Make sure an insight starts with its 'Based on your …,' phrase (and not the athlete's name)."""
+    t = (text or "").strip()
+    if not t or "unavailable" in t.lower():
+        return t
+    if first_name and re.match(rf"^{re.escape(first_name)}\s*[,:\-—]\s*", t, flags=re.I):
+        t = re.sub(rf"^{re.escape(first_name)}\s*[,:\-—]\s*", "", t, count=1, flags=re.I)
+    if t.lower().startswith("based on"):
+        return t[0].upper() + t[1:]
+    if t[:2] != "I " and not t[:2].isupper():
+        t = t[0].lower() + t[1:]
+    return f"{opener} {t}"
+
+
 def make_ai_suggestions(
         athlete_name, selected_date, session_rpe, session_quality,
         sleep, fatigue, mood, soreness, notes, sets_reps_load,
@@ -1983,6 +2027,13 @@ def make_ai_suggestions(
     if ai_mode_1 == ai_mode_2:
         ai_mode_2 = "Recovery & Readiness Coach"
 
+    opener_1, opener_2 = feedback_openers(notes, sets_reps_load, track_reps_times, session_rpe, session_quality,
+                                          ai_mode_1, ai_mode_2)
+    opener_rule_1 = (f"Start with exactly '{opener_1}' and continue the same sentence. Do not start with the "
+                     f"athlete's name. Write to the athlete as 'you'.")
+    opener_rule_2 = (f"Start with exactly '{opener_2}' and continue the same sentence. Do not start with the "
+                     f"athlete's name. Write to the athlete as 'you'.")
+
     persona_1 = persona_prompt(ai_mode_1)
     system_1 = (
         f"{persona_1}\n\n"
@@ -1995,7 +2046,7 @@ def make_ai_suggestions(
         "Do NOT mention injury or medical issues. "
         "BANNED PHRASES: looked, looks, looking, appeared, it looked like, looked controlled, looked strong — "
         "these imply visual observation. Use felt, came in, registered, held, sat, tracked, ran, moved instead. "
-        f"Always open with '{first_name},' — this is mandatory.\n\n"
+        f"{opener_rule_1}\n\n"
         f"YOUR LENS ({ai_mode_1}):\n{PERSONA_LENS.get(ai_mode_1, PERSONA_LENS['General'])}\n\n"
         f"{CRAFT_FRAMING_RULES}\n\n"
         f"{INSIGHT_FORMAT_RULES}"
@@ -2012,12 +2063,13 @@ def make_ai_suggestions(
         f"Write feedback as the {ai_mode_1}.\n"
         "BANNED PHRASES: looked, looks, looking, appeared, it looked like — "
         "these imply visual observation. Use felt, came in, held, sat, tracked, ran, moved instead. "
-        f"Always open with '{first_name},' — this is mandatory."
+        f"{opener_rule_1}\n"
         "The athlete has just finished this session. React to what they actually did.\n"
         "Reference ONLY the workout, focus, venue, RPE, sets/reps/load, track times, and notes explicitly listed above.\n"
         "If sets/reps or track times say 'none provided', do not mention them.\n"
         "Do NOT fabricate any exercise names, distances, loads, or times not in the data.\n"
-        f"Stay strictly inside the {ai_mode_1} lens described in your instructions.\n"
+        f"Stay strictly inside the {ai_mode_1} lens described in your instructions, and base every observation "
+        "on that category's FOCUS list.\n"
         "Give 2-3 specific observations grounded entirely in the logged data.\n"
         "End with one forward-looking action for the next 24-48 hours, tied to what was logged.\n"
         "3-4 sentences, under 80 words, plain text. No waffle, no generics."
@@ -2034,7 +2086,7 @@ def make_ai_suggestions(
         f"You MUST NOT repeat or echo anything the {ai_mode_1} would say. "
         "Your observations must come from a completely different coaching lens. "
         "Focus on what the primary coach will NOT cover. "
-        f"Always open with '{first_name},' — this is mandatory.\n\n"
+        f"{opener_rule_2}\n\n"
         f"YOUR LENS ({ai_mode_2}):\n{PERSONA_LENS.get(ai_mode_2, PERSONA_LENS['General'])}\n\n"
         f"{CRAFT_FRAMING_RULES}\n\n"
         f"{INSIGHT_FORMAT_RULES}"
@@ -2052,13 +2104,14 @@ def make_ai_suggestions(
         f"Wellness pattern scan (last 7 days):\n{wellness_scan}\n\n"
         "TASK — SECONDARY COACH:\n"
         f"Write as the {ai_mode_2}.\n"
-        f"Open with '{first_name},'\n"
+        f"{opener_rule_2}\n"
         "The athlete has just finished this session. React to what they actually did.\n"
         "Reference ONLY data explicitly listed above — workout, focus, RPE, wellness scores, notes logged.\n"
         "If a field says 'none provided', skip it entirely.\n"
          "Do NOT fabricate exercises, loads, or times not in the data.\n"
         f"Do NOT repeat observations already covered by the {ai_mode_1} — your angle must be distinct.\n"
-        f"Stay strictly inside the {ai_mode_2} lens described in your instructions.\n"
+        f"Stay strictly inside the {ai_mode_2} lens described in your instructions, and base every observation "
+        "on that category's FOCUS list.\n"
         "Give 2 specific observations from the logged data that the primary coach would not address.\n"
         "End with ONE reflective question about their training based on what was logged.\n"
         "3-4 sentences, under 80 words, plain text. Be direct."
@@ -2079,8 +2132,8 @@ def make_ai_suggestions(
         ai1 = future_1.result()
         ai2 = future_2.result()
 
-    ai1 = clean_insight(ai1)
-    ai2 = clean_insight(ai2)
+    ai1 = ensure_opener(clean_insight(ai1), opener_1, first_name)
+    ai2 = ensure_opener(clean_insight(ai2), opener_2, first_name)
 
     # ── AGENTIC STEP 2: verify-and-revise pass ──
     # Run both drafts through a narrow fact-check call against the actual
@@ -2090,8 +2143,8 @@ def make_ai_suggestions(
     with ThreadPoolExecutor(max_workers=2) as verify_executor:
         v_future_1 = verify_executor.submit(verify_and_revise_insight, ai1, user_1, ai_mode_1)
         v_future_2 = verify_executor.submit(verify_and_revise_insight, ai2, user_2, ai_mode_2)
-        ai1 = clean_insight(v_future_1.result() or ai1)
-        ai2 = clean_insight(v_future_2.result() or ai2)
+        ai1 = ensure_opener(clean_insight(v_future_1.result() or ai1), opener_1, first_name)
+        ai2 = ensure_opener(clean_insight(v_future_2.result() or ai2), opener_2, first_name)
 
     return ai1, ai2, ai_mode_1, ai_mode_2, craft["flags"]
 
@@ -2306,7 +2359,8 @@ def _radar_ai_summary(df, athlete_name="", mode="curr"):
             "For Soreness, 5 = worst (most sore). Energy 5 means fully energised, NOT tired — never describe a high "
             "energy score as fatigue or stress.\n\n"
             f"Comparison window: {compare_label}\n\n"
-            f"Open with '{first_name},' then give 2 sentences of specific coaching insight based on these numbers. "
+            "Start with exactly 'Based on your check-ins,' then give 2 sentences of specific coaching insight based "
+            "on these numbers. "
             f"Reference the scores directly. Say what the pattern means for their training this week."
         )
 
@@ -2316,7 +2370,7 @@ def _radar_ai_summary(df, athlete_name="", mode="curr"):
 
         system_prompt = (
             "You are a performance coach giving a direct, personal readiness summary to an athlete. "
-            "Always open with their first name followed by a comma — this is mandatory. "
+            "Always start with 'Based on your check-ins,' — this is mandatory. Do not start with the athlete's name. "
             "Write in past tense. Reference the actual numbers logged. "
             "2 sentences maximum. No fluff, no generic advice. "
             "Tone: direct, warm, like a coach who has looked at the data and has something real to say. "
@@ -2348,7 +2402,7 @@ def _radar_ai_summary(df, athlete_name="", mode="curr"):
                 "Current readiness markers are generally positive."
             )
 
-        return insight.strip()
+        return ensure_opener(clean_insight(insight), "Based on your check-ins,", first_name)
 
     except Exception as e:
 
@@ -4684,7 +4738,14 @@ app.index_string = """
           .lens-q.pick2 { border-color: #2fb344; background: rgba(47,179,68,.12); }
           .lens-q.pick2 .lq-n { background: #2fb344; border-color: #2fb344; }
           .lens-hint { font-size: 12.5px; color: var(--text-muted); }
-          .lens-hist { display: flex; flex-direction: column; gap: 5px; margin-top: 2px; }
+          .lens-hist { display: flex; flex-direction: column; gap: 6px; margin-top: 2px; }
+          .lh-cols { display: flex; justify-content: space-between; align-items: flex-end; gap: 6px;
+                     padding: 4px 2px 0 2px; }
+          .lh-col { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 3px; min-width: 0; }
+          .lh-bar { width: 100%; max-width: 34px; border-radius: 6px 6px 2px 2px; }
+          .lh-col .lh-n { font-size: 12px; font-weight: 700; color: var(--text); font-variant-numeric: tabular-nums; }
+          .lh-col .lh-ic { font-size: 14px; line-height: 1; margin-top: 2px; }
+          .lh-col .lh-l { font-size: 11.5px; color: var(--text-muted); white-space: nowrap; }
           .lens-hist-row { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--text-muted); }
           .lens-hist-row .lh-l { width: 70px; flex: none; }
           .lens-hist-row .lh-b { height: 7px; border-radius: 4px; min-width: 3px; }
@@ -10978,8 +11039,9 @@ _EXTRA_ATHLETE_WORDS = {
 }
 
 
-def lens_history(df: pd.DataFrame, today: dt.date, days: int = 120) -> dict:
-    """How often each lens has been used in the athlete's recent feedback ('[lens] text' in AI_Suggestion_1/2)."""
+def lens_history(df: pd.DataFrame, today: dt.date, days: int = 366) -> dict:
+    """How often each lens has been used in the athlete's feedback this season, read back through every
+    logged day in their calendar ('[lens] text' in AI_Suggestion_1/2)."""
     counts = {v: 0 for v in LENS_INFO}
     if df is None or df.empty or "Date" not in df.columns:
         return counts
@@ -11096,12 +11158,12 @@ def lens_picker_layout():
                   html.Span([html.I(id="lens-chip-2-ic"), html.Span(id="lens-chip-2-tx")],
                             id="lens-chip-2", className="lens-chip")], className="lens-chips"),
         dcc.Markdown(id="lens-why", className="lens-why", dangerously_allow_html=True),
+        html.Div(id="lens-hist", className="lens-hist"),
         html.Button("Change ›", id="lens-change-btn", n_clicks=0, className="lens-change"),
         html.Div([
             html.Div("Based on the notes you've entered today, what would you like feedback on? "
                      "Pick up to two — your first pick leads.", className="lens-hint"),
             *[_lens_question(v) for v, *_ in LENSES],
-            html.Div(id="lens-hist", className="lens-hist"),
         ], id="lens-panel", className="lens-panel", style={"display": "none"}),
     ], className="lens-card", style={"marginBottom": "4px"})
 
@@ -11138,16 +11200,21 @@ def update_smart_lens(selected_date, athlete_id, _b1, _b2, _b3, notes, gym, trac
     total = sum(counts.values())
     hist = []
     if total:
-        hist.append(html.Div("Feedback you've had recently", className="lens-hint", style={"marginTop": "4px"}))
         top = max(counts.values()) or 1
+        cols = []
         for v, *_ in LENSES:
             info = LENS_INFO[v]
-            hist.append(html.Div([
-                html.Span(info["short"], className="lh-l"),
-                html.Span(className="lh-b", style={"width": f"{max(3, 150 * counts[v] / top):.0f}px",
-                                                    "background": info["col"]}),
-                html.Span(str(counts[v]), className="lh-n"),
-            ], className="lens-hist-row"))
+            n = counts[v]
+            cols.append(html.Div([
+                html.Div(str(n), className="lh-n"),
+                html.Div(className="lh-bar", style={"height": f"{max(3, 46 * n / top):.0f}px",
+                                                     "background": info["col"],
+                                                     "opacity": "1" if n == top else ".75"}),
+                html.I(className=f"bi bi-{info['icon']} lh-ic", style={"color": info["col"]}),
+                html.Div(info["short"], className="lh-l"),
+            ], className="lh-col", title=f"{info['short']}: {n} times"))
+        hist = [html.Div(f"Your feedback this season · {total}", className="lens-hint"),
+                html.Div(cols, className="lh-cols")]
     current = current or {}
     if current.get("manual") and not new_day:
         # The athlete chose for themselves: keep their choice, just refresh the history.
@@ -11594,6 +11661,7 @@ app.clientside_callback(
     Input("chat-clear", "n_clicks"),
     prevent_initial_call=True,
 )
+
 
 # "Thinking" bubble with a heartbeat line while the answer is on its way.
 app.clientside_callback(
