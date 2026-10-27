@@ -11130,12 +11130,17 @@ def smart_lens_pick(df: pd.DataFrame, day: dt.date, notes: str = "", gym: str = 
     l2 = next((v for v in order if v != l1 and score[v] > 0), None) or (
         "Recovery & Readiness Coach" if l1 != "Recovery & Readiness Coach" else "Acceleration & Speed Coach")
 
-    reasons = (why[l1][:1] + why[l2][:1])
+    # One reason per lens, without repeating the same reason twice
+    # (e.g. when the plan alone points to both lenses).
+    reasons = why[l1][:1]
+    extra = next((r for r in why[l2] if r not in reasons), None)
+    if extra:
+        reasons = reasons + [extra]
     if not reasons and total:
         fav = max(counts, key=counts.get)
         reasons = [f"you often ask for <b>{LENS_INFO[fav]['short'].lower()}</b> feedback"]
-    text = ("Picked because " + " and ".join(reasons) + ".") if reasons else \
-        "Picked from today's session. Change it if you want a different view."
+    text = ("Selected because " + " and ".join(reasons) + ".") if reasons else \
+        "Selected from today's session. Change it if you want a different view."
     return {"l1": l1, "l2": l2, "why": text, "counts": counts}
 
 
@@ -11253,7 +11258,7 @@ app.clientside_callback(
         pick = pick || {};
         function chip(v, n){
             if(!v || !INFO[v]){
-                if(n === 2 && pick.l1) return ["", "＋ 2nd picked for you", {display: "inline-flex", color: "var(--text-muted)",
+                if(n === 2 && pick.l1) return ["", "＋ 2nd selected for you", {display: "inline-flex", color: "var(--text-muted)",
                                                 background: "transparent", border: "1px dashed var(--border)"}];
                 return ["", "", {display: "none"}];
             }
@@ -11661,7 +11666,6 @@ app.clientside_callback(
     Input("chat-clear", "n_clicks"),
     prevent_initial_call=True,
 )
-
 
 # "Thinking" bubble with a heartbeat line while the answer is on its way.
 app.clientside_callback(
