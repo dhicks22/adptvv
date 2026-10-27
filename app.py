@@ -1592,7 +1592,7 @@ def verify_and_revise_insight(insight: str, session_block: str, coach_label: str
         "OK\n"
         "REVISE: <corrected message>\n"
         "The corrected message must keep the same coach voice and length, change only the unsupported "
-        "detail(s), keep the draft's opening words exactly (e.g. 'Based on your notes,'), and be plain text. Output NOTHING else — "
+        "detail(s), keep the draft's opening words exactly (e.g. 'Sam, going by your notes,'), and be plain text. Output NOTHING else — "
         "no reason, no explanation, no notes, no markdown."
     )
     check_user = f"SESSION DATA:\n{session_block}\n\nDRAFT ({coach_label}):\n{insight}"
@@ -1896,36 +1896,66 @@ CRAFT_FRAMING_RULES = (
 )
 
 
+# Ways to say where the feedback comes from. One is chosen at random each time,
+# so cards don't all open the same way. Each insight reads "<Name>, <phrase> …".
+OPENER_PHRASES = {
+    "notes": ["based on your notes,", "from what you logged today,", "going by your notes,",
+              "reading through your notes,", "from your session notes,", "based on what you wrote today,"],
+    "rated": ["based on your session feedback,", "from how you rated the session,",
+              "going by your session ratings,", "based on how the session felt to you,"],
+    "session": ["based on today's session,", "from today's session,", "going by today's session,"],
+    "recovery": ["based on your check-in and session feedback,", "from your check-in today,",
+                 "going by your check-in and session ratings,", "reading your check-in,",
+                 "based on how you checked in today,"],
+    "checkins": ["based on your check-ins,", "across your recent check-ins,", "going by your check-ins,",
+                 "from your last few check-ins,", "reading your recent check-ins,"],
+}
+_ALL_OPENER_PHRASES = sorted({p for ps in OPENER_PHRASES.values() for p in ps}, key=len, reverse=True)
+
+
+def pick_opener(kind: str, avoid: str = "") -> str:
+    import random
+    pool = [p for p in OPENER_PHRASES.get(kind, OPENER_PHRASES["session"]) if p != avoid]
+    return random.choice(pool or OPENER_PHRASES["session"])
+
+
 def feedback_openers(notes, sets_reps_load, track_reps_times, session_rpe, session_quality,
                      lens_1="", lens_2=""):
-    """The words each insight must start with, chosen from what the athlete entered and the lens used:
-    the Recovery lens reads the check-in and session ratings; the others read what the athlete wrote."""
+    """The phrase each insight opens with (after the athlete's name), chosen from what the athlete
+    entered and the lens used: the Recovery lens reads the check-in and session ratings; the others
+    read what the athlete wrote. The two cards never get the same phrase."""
     def _has(v):
         return str(v or "").strip().lower() not in ("", "none provided", "nan", "none")
     wrote = any(_has(v) for v in (notes, sets_reps_load, track_reps_times))
     rated = any(_has(v) for v in (session_rpe, session_quality))
 
-    def _one(lens):
+    def _kind(lens):
         if lens == "Recovery & Readiness Coach":
-            return "Based on your check-in and session feedback,"
-        if wrote:
-            return "Based on your notes,"
-        return "Based on your session feedback," if rated else "Based on today's session,"
-    return _one(lens_1), _one(lens_2)
+            return "recovery"
+        return "notes" if wrote else ("rated" if rated else "session")
+    o1 = pick_opener(_kind(lens_1))
+    o2 = pick_opener(_kind(lens_2), avoid=o1)
+    return o1, o2
 
 
 def ensure_opener(text: str, opener: str, first_name: str = "") -> str:
-    """Make sure an insight starts with its 'Based on your …,' phrase (and not the athlete's name)."""
+    """Make every insight read '<Name>, <where it comes from> …', e.g. 'Sam, going by your notes, …'.
+    Keeps a source phrase the model already wrote; otherwise adds the chosen one."""
     t = (text or "").strip()
     if not t or "unavailable" in t.lower():
         return t
-    if first_name and re.match(rf"^{re.escape(first_name)}\s*[,:\-—]\s*", t, flags=re.I):
-        t = re.sub(rf"^{re.escape(first_name)}\s*[,:\-—]\s*", "", t, count=1, flags=re.I)
-    if t.lower().startswith("based on"):
-        return t[0].upper() + t[1:]
+    if first_name and re.match(rf"^{re.escape(first_name)}\b\s*[,:\-—]?\s*", t, flags=re.I):
+        t = re.sub(rf"^{re.escape(first_name)}\b\s*[,:\-—]?\s*", "", t, count=1, flags=re.I)
+    low = t.lower()
+    has_source = any(low.startswith(p.rstrip(",")) for p in _ALL_OPENER_PHRASES) or bool(re.match(
+        r"^(based on|going by|reading( through)?|from (your|what|how|today)|across your|according to|judging by)"
+        r"\b[^,.]{0,60},", low))
     if t[:2] != "I " and not t[:2].isupper():
         t = t[0].lower() + t[1:]
-    return f"{opener} {t}"
+    body = t if has_source else f"{opener} {t}"
+    if first_name:
+        return f"{first_name}, {body}"
+    return body[0].upper() + body[1:]
 
 
 def make_ai_suggestions(
@@ -2029,10 +2059,10 @@ def make_ai_suggestions(
 
     opener_1, opener_2 = feedback_openers(notes, sets_reps_load, track_reps_times, session_rpe, session_quality,
                                           ai_mode_1, ai_mode_2)
-    opener_rule_1 = (f"Start with exactly '{opener_1}' and continue the same sentence. Do not start with the "
-                     f"athlete's name. Write to the athlete as 'you'.")
-    opener_rule_2 = (f"Start with exactly '{opener_2}' and continue the same sentence. Do not start with the "
-                     f"athlete's name. Write to the athlete as 'you'.")
+    opener_rule_1 = (f"Start with exactly '{first_name}, {opener_1}' and continue the same sentence. "
+                     f"Do not use the athlete's name again after that. Write to the athlete as 'you'.")
+    opener_rule_2 = (f"Start with exactly '{first_name}, {opener_2}' and continue the same sentence. "
+                     f"Do not use the athlete's name again after that. Write to the athlete as 'you'.")
 
     persona_1 = persona_prompt(ai_mode_1)
     system_1 = (
@@ -2347,6 +2377,7 @@ def _radar_ai_summary(df, athlete_name="", mode="curr"):
         # ---------------------------------------------------------
 
         first_name = athlete_name.strip().split()[0] if athlete_name.strip() else "Athlete"
+        radar_opener = pick_opener("checkins")
         context = (
             f"Athlete first name: {first_name}\n\n"
             f"7-day wellness averages (1–5 scale):\n"
@@ -2359,7 +2390,7 @@ def _radar_ai_summary(df, athlete_name="", mode="curr"):
             "For Soreness, 5 = worst (most sore). Energy 5 means fully energised, NOT tired — never describe a high "
             "energy score as fatigue or stress.\n\n"
             f"Comparison window: {compare_label}\n\n"
-            "Start with exactly 'Based on your check-ins,' then give 2 sentences of specific coaching insight based "
+            f"Start with exactly '{first_name}, {radar_opener}' then give 2 sentences of specific coaching insight based "
             "on these numbers. "
             f"Reference the scores directly. Say what the pattern means for their training this week."
         )
@@ -2370,7 +2401,8 @@ def _radar_ai_summary(df, athlete_name="", mode="curr"):
 
         system_prompt = (
             "You are a performance coach giving a direct, personal readiness summary to an athlete. "
-            "Always start with 'Based on your check-ins,' — this is mandatory. Do not start with the athlete's name. "
+            f"Always start with '{first_name}, {radar_opener}' — this is mandatory. "
+            "Do not use the athlete's name again after that. "
             "Write in past tense. Reference the actual numbers logged. "
             "2 sentences maximum. No fluff, no generic advice. "
             "Tone: direct, warm, like a coach who has looked at the data and has something real to say. "
@@ -2402,7 +2434,7 @@ def _radar_ai_summary(df, athlete_name="", mode="curr"):
                 "Current readiness markers are generally positive."
             )
 
-        return ensure_opener(clean_insight(insight), "Based on your check-ins,", first_name)
+        return ensure_opener(clean_insight(insight), radar_opener, first_name)
 
     except Exception as e:
 
