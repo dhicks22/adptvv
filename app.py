@@ -104,19 +104,21 @@ if RAW_USER_LOGINS:
 
 print("User login config loaded keys:", list(USER_LOGINS.keys()))
 
+# No logins are stored in the code. On Render they come from the USER_LOGINS
+# environment variable. To run the app on your own computer, put the same JSON
+# in a file called logins.json next to app.py (and keep that file out of GitHub:
+# add "logins.json" to .gitignore).
 if not USER_LOGINS:
-    USER_LOGINS = {
-        "Dylan Hicks": {"username": "Dylan", "password": "1234", "sheet": "Dylan Hicks", "role": "coach"},
-        "Harrison Hunt": {"username": "Harrison", "password": "4624", "sheet": "Harrison Hunt", "role": "athlete"},
-        "Default": {"username": "Default", "password": "1234", "sheet": "Default", "role": "coach"},
-        "Cailen Hejka": {"username": "Cailen", "password": "1071", "sheet": "Cailen Hejka", "role": "athlete"},
-        "Corey Baker": {"username": "Corey", "password": "1096", "sheet": "Corey Baker", "role": "coach"},
-        "Gaby Philis": {"username": "Gaby", "password": "0000", "sheet": "Gaby Philis", "role": "coach"},
-        "Alex Dunn": {"username": "Alex", "password": "1444", "sheet": "Alex Dunn", "role": "athlete"},
-        "Max Thompson": {"username": "Max", "password": "5371", "sheet": "Max Thompson", "role": "athlete"},
-        "Michael Moschou": {"username": "Michael", "password": "1048", "sheet": "Michael Moschou", "role": "athlete"},
-    }
-    print("⚠️ USER_LOGINS not found — using local fallback login.")
+    _logins_file = os.getenv("USER_LOGINS_FILE") or os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                                 "logins.json")
+    try:
+        with open(_logins_file, encoding="utf-8") as _f:
+            USER_LOGINS = json.load(_f)
+        print(f"User logins loaded from {os.path.basename(_logins_file)}")
+    except FileNotFoundError:
+        print("⚠️ No logins set up: add USER_LOGINS in Render, or logins.json when running locally.")
+    except Exception as _e4:
+        print(f"⚠️ Could not read {_logins_file}: {_e4}")
 
 # ============================================================
 #  Timezone
@@ -607,10 +609,38 @@ def log_tap_row(key: str, label: str, low: str, high: str):
     ], className="ci-q")
 
 
+# Google Sheets limits how many requests the app can make per minute, so the
+# list of tabs and each tab's worksheet handle are kept for 5 minutes instead
+# of being looked up on every read and write.
+_ws_cache = {"tabs": (0.0, {})}
+WS_CACHE_TTL = 300
+
+
+def _worksheets_by_title():
+    ts, d = _ws_cache["tabs"]
+    if sh is None:
+        return {}
+    if time.time() - ts > WS_CACHE_TTL or not d:
+        d = {ws.title: ws for ws in sh.worksheets()}
+        _ws_cache["tabs"] = (time.time(), d)
+    return d
+
+
+def get_ws(tab_name: str):
+    """Worksheet by name (cached). Raises gspread.WorksheetNotFound like sh.worksheet()."""
+    ws = _worksheets_by_title().get(tab_name)
+    if ws is None:
+        _ws_cache["tabs"] = (0.0, {})          # maybe a new tab: look again once
+        ws = _worksheets_by_title().get(tab_name)
+    if ws is None:
+        raise gspread.WorksheetNotFound(tab_name)
+    return ws
+
+
 def list_tabs():
     if sh is None:
         return []
-    return [ws.title for ws in sh.worksheets()]
+    return list(_worksheets_by_title().keys())
 
 
 # Columns where we want to preserve hyperlinks from Google Sheets
@@ -639,9 +669,11 @@ def load_tab(tab_name: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     try:
-        ws = sh.worksheet(tab_name)
+        ws = get_ws(tab_name)
     except gspread.WorksheetNotFound:
-        ws = sh.get_worksheet(0)
+        # Never fall back to another tab — that would show someone else's data.
+        print(f"⚠️ No tab called {tab_name!r}")
+        return pd.DataFrame()
 
     # Fetch formula render so we get =HYPERLINK(...) formulas intact
     try:
@@ -801,7 +833,7 @@ def write_row(tab_name: str, row_idx_0: int, payload: dict):
     """
     if sh is None:
         return
-    ws = sh.worksheet(tab_name)
+    ws = get_ws(tab_name)
     headers = ws.row_values(1)
     if not headers:
         return
@@ -823,7 +855,7 @@ def write_row(tab_name: str, row_idx_0: int, payload: dict):
 def append_row_for_date(tab_name: str, date_obj: dt.date, payload: dict) -> int:
     if sh is None:
         raise RuntimeError("Google Sheets not connected")
-    ws = sh.worksheet(tab_name)
+    ws = get_ws(tab_name)
     sheet_vals = ws.get_all_values()
     if not sheet_vals:
         raise RuntimeError("Sheet is empty — no headers found")
@@ -1965,7 +1997,7 @@ def make_ai_suggestions(
 ):
     from concurrent.futures import ThreadPoolExecutor
 
-    df = load_tab(athlete_name)
+    df = load_tab_cached(athlete_name)
 
     if df is None or df.empty:
         return "No athlete data available yet.", "", ai_mode_1, ai_mode_2, []
@@ -2779,6 +2811,11 @@ def freshness_label(days: int | None) -> str:
 
 
 STALE_DAYS = 2   # scores grey out once the latest data is this many days old
+
+
+def stale_flag_off(days_ago):
+    """Don't raise a readiness flag on numbers that are already out of date."""
+    return days_ago is None or days_ago >= STALE_DAYS
 
 
 # ============================================================
@@ -4622,7 +4659,7 @@ app = Dash(
     __name__,
     external_stylesheets=[dbc.themes.BOOTSTRAP],
     suppress_callback_exceptions=True,
-    title="ADPTIV",
+    title="ADPTVV",
     update_title=None,
 )
 
@@ -4634,6 +4671,123 @@ server.secret_key = os.getenv("FLASK_SECRET_KEY") or hashlib.sha256(
 server.config.update(SESSION_COOKIE_SAMESITE="Lax", SESSION_COOKIE_HTTPONLY=True,
                      SESSION_COOKIE_SECURE=bool(os.getenv("RENDER")))
 app._favicon = "icon-192.png"
+
+
+# ============================================================
+#  Error alerts (optional). Set SENTRY_DSN on Render to get an email when the
+#  app crashes. Nothing happens if it isn't set or sentry-sdk isn't installed.
+# ============================================================
+if os.getenv("SENTRY_DSN"):
+    try:
+        import sentry_sdk
+        sentry_sdk.init(dsn=os.getenv("SENTRY_DSN"), traces_sample_rate=0.0,
+                        send_default_pii=False, environment="render" if os.getenv("RENDER") else "local")
+        print("Sentry error alerts on")
+    except Exception as _se:
+        print(f"⚠️ Sentry not started: {_se}")
+
+
+# ============================================================
+#  Who is logged in — decided by the server, never the browser.
+#
+#  The page keeps a copy of the login in the browser ("auth-store"), and most
+#  callbacks read the athlete from the Athlete dropdown. Both could be edited by
+#  a technical user to view someone else's data. Before any callback runs, this
+#  replaces them with what the signed login cookie says: athletes are always
+#  locked to their own sheet, and nobody gets data without logging in.
+# ============================================================
+
+def current_user():
+    """The logged-in user from the signed cookie, or None."""
+    u = flask_session.get("adtv_user") or {}
+    if not u.get("name") or u.get("name") not in USER_LOGINS:
+        return None
+    info = USER_LOGINS[u["name"]]
+    role = str(info.get("role", "athlete")).lower()
+    return {"name": u["name"], "sheet": info.get("sheet", ""), "role": role,
+            "is_coach": role == "coach", "username": str(info.get("username", ""))}
+
+
+def _trusted_auth():
+    u = current_user()
+    if not u:
+        return {"authed": False}
+    return {"authed": True, "username": u["username"], "athlete_name": u["name"],
+            "athlete_sheet": u["sheet"], "is_coach": u["is_coach"]}
+
+
+def _rewrite_items(items, u):
+    for it in items or []:
+        if isinstance(it, list):            # pattern-matching groups
+            _rewrite_items(it, u)
+            continue
+        if not isinstance(it, dict):
+            continue
+        cid, prop = it.get("id"), it.get("property")
+        if cid == "auth-store" and prop == "data":
+            it["value"] = _trusted_auth()
+        elif cid == "athlete-dropdown" and prop == "value":
+            if not u:
+                it["value"] = None
+            elif not u["is_coach"]:
+                it["value"] = u["sheet"]
+
+
+@server.before_request
+def _enforce_identity():
+    if not flask_request.path.endswith("_dash-update-component"):
+        return None
+    body = flask_request.get_json(silent=True)   # cached, so Dash sees the edited copy
+    if not isinstance(body, dict):
+        return None
+    u = current_user()
+    _rewrite_items(body.get("inputs"), u)
+    _rewrite_items(body.get("state"), u)
+    return None
+
+
+def coach_only():
+    """For plain web routes: returns an error response unless a coach is logged in."""
+    u = current_user()
+    if not u or not u["is_coach"]:
+        return jsonify({"error": "Log in to ADPTVV as a coach first."}), 403
+    return None
+
+
+# Login attempts: after 5 wrong tries for a username (or from one device), wait 5 minutes.
+LOGIN_MAX_FAILS = 5
+LOGIN_LOCK_SECS = 300
+_login_fails = {}      # key -> [count, first_fail_time, locked_until]
+
+
+def _login_keys(username):
+    ip = (flask_request.headers.get("X-Forwarded-For", "") or flask_request.remote_addr or "").split(",")[0].strip()
+    return [f"u:{(username or '').strip().lower()}", f"ip:{ip}"]
+
+
+def login_locked(username):
+    now = time.time()
+    waits = [rec[2] - now for k in _login_keys(username) if (rec := _login_fails.get(k)) and rec[2] > now]
+    return int(max(waits)) + 1 if waits else 0
+
+
+def login_failed(username):
+    now = time.time()
+    for k in _login_keys(username):
+        rec = _login_fails.get(k)
+        if not rec or now - rec[1] > LOGIN_LOCK_SECS:
+            rec = [0, now, 0]
+        rec[0] += 1
+        # One device/network gets more tries, since a squad may share the same wifi.
+        if rec[0] >= (LOGIN_MAX_FAILS if k.startswith("u:") else LOGIN_MAX_FAILS * 4):
+            rec[2] = now + LOGIN_LOCK_SECS
+            rec[0], rec[1] = 0, now
+        _login_fails[k] = rec
+
+
+def login_ok(username):
+    for k in _login_keys(username):
+        _login_fails.pop(k, None)
 
 app.index_string = """
 <!DOCTYPE html>
@@ -4739,6 +4893,19 @@ app.index_string = """
           #btn-generate-ai.ai-save-btn:hover { filter: brightness(1.05); }
           #btn-generate-ai.ai-save-btn:active { transform: scale(.98); box-shadow: 0 2px 8px rgba(38,163,68,.3); }
           #btn-generate-ai.ai-save-btn:disabled { filter: grayscale(.4) brightness(.9); box-shadow: none; }
+
+          /* ---- Feedback cards: lens badge, waiting state ---- */
+          .fb-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+          .fb-badge { display: inline-flex; align-items: center; gap: 6px; border-radius: 999px; padding: 3px 10px;
+                      font-size: 12.5px; font-weight: 700; }
+          .fb-badge .bi { font-size: 13px; }
+          .fb-src { font-size: 11.5px; color: var(--text-muted); }
+          .squad-flags { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 8px; }
+          .squad-flag { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; font-weight: 600;
+                        border: 1px solid; border-radius: 999px; padding: 2px 9px; }
+          .squad-export { font-size: 12.5px; color: var(--accent, #4dabf7); text-decoration: none; font-weight: 600; }
+          .fb-wait { display: flex; align-items: center; gap: 10px; padding: 14px; border-radius: 14px;
+                     border: 1px dashed var(--border); background: var(--card-bg); }
           /* ---- Feedback picker (smart pick) ---- */
           .lens-card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 16px;
                        padding: 14px; display: flex; flex-direction: column; gap: 10px; }
@@ -5487,10 +5654,12 @@ def build_main_layout(auth_data):
                             dbc.Button([html.I(className="bi bi-check2-circle"), html.Span("Save & get feedback")],
                                        id="btn-generate-ai", className="mt-3 w-100 ai-save-btn"),
                             html.Div(id="save-status", className="mt-2"),
-                            dcc.Loading(id="ai-loader", type="circle", children=[
-                                html.Div(id="ai-suggestion-1", className="mt-3"),
-                                html.Div(id="ai-suggestion-2", className="mt-3"),
-                            ]),
+                            # Feedback is written in the background after the session is saved;
+                            # this timer checks every 2 s until both cards are ready.
+                            dcc.Store(id="ai-job"),
+                            dcc.Interval(id="ai-poll", interval=2000, disabled=True),
+                            html.Div(id="ai-suggestion-1", className="mt-3"),
+                            html.Div(id="ai-suggestion-2", className="mt-3"),
                         ], md=6),
                     ]),
                 ],
@@ -6070,21 +6239,31 @@ def do_login(n_clicks, username, password):
     if not n_clicks:
         raise PreventUpdate
     if not username or not password:
-        return {"authed": False}, "Enter both username and password."
+        return no_update, "Enter both username and password."
+    if not USER_LOGINS:
+        return no_update, "Logins aren't set up yet — ask your coach."
+
+    wait = login_locked(username)
+    if wait:
+        mins = max(1, round(wait / 60))
+        return no_update, f"Too many tries. Wait {mins} minute{'s' if mins > 1 else ''} and try again."
 
     for athlete_key, info in USER_LOGINS.items():
         u = str(info.get("username", "")).strip().lower()
         p = str(info.get("password", "")).strip()
         role = str(info.get("role", "athlete")).lower()
         sheet = info.get("sheet", "")
-        if username.strip().lower() == u and password.strip() == p:
+        if (hmac.compare_digest(username.strip().lower().encode(), u.encode())
+                and hmac.compare_digest(password.strip().encode(), p.encode())):
+            login_ok(username)
             flask_session["adtv_user"] = {"sheet": sheet, "name": athlete_key,
                                           "role": role, "at": time.time()}
             return ({"authed": True, "username": username.strip(),
                      "athlete_name": athlete_key, "athlete_sheet": sheet,
                      "is_coach": (role == "coach")}, "")
 
-    return {"authed": False}, "Incorrect username or password."
+    login_failed(username)
+    return no_update, "Incorrect username or password."
 
 
 @app.callback(
@@ -6414,10 +6593,10 @@ def on_day_click(n_clicks_list, close_n, edit_n, athlete_name):
     m1 = re.match(r'^\[(.+?)\]\s*', ai1)
     m2 = re.match(r'^\[(.+?)\]\s*', ai2)
     if m1:
-        mode_1_label = m1.group(1).replace(" Coach", "")
+        mode_1_label = LENS_INFO.get(m1.group(1), {}).get("q") or m1.group(1).replace(" Coach", "")
         ai1 = ai1[m1.end():]
     if m2:
-        mode_2_label = m2.group(1).replace(" Coach", "")
+        mode_2_label = LENS_INFO.get(m2.group(1), {}).get("q") or m2.group(1).replace(" Coach", "")
         ai2 = ai2[m2.end():]
 
     sleep_v = num("Sleep_1_5")
@@ -6687,7 +6866,10 @@ def populate_session_context(selected_date, athlete_name):
     [Output("ai-suggestion-1", "children"),
      Output("ai-suggestion-2", "children"),
      Output("save-status", "children"),
-     Output("refresh-btn", "n_clicks")],
+     Output("refresh-btn", "n_clicks"),
+     Output("ai-job", "data"),
+     Output("ai-poll", "disabled"),
+     Output("btn-generate-ai", "disabled")],
     Input("btn-generate-ai", "n_clicks"),
     [State("athlete-dropdown", "value"),
      State("selected-date-store", "data"),
@@ -6726,13 +6908,13 @@ def save_and_ai(
     mood = si.get("mood")
     soreness = si.get("soreness")
     if not n_clicks:          raise PreventUpdate
-    if not athlete_name:      return no_update, no_update, "⚠️ Please select an athlete first.", no_update
+    if not athlete_name:      return no_update, no_update, "⚠️ Please select an athlete first.", no_update, no_update, no_update, no_update
     # NOTE: ai_mode_1 / ai_mode_2 are no longer mandatory here — if either
     # is left unselected, make_ai_suggestions() auto-picks a persona based
     # on the athlete's logged notes and wellness scan (see AGENTIC STEP 1
     # in make_ai_suggestions). The resolved persona names are surfaced back
     # from that call and used below for display, storage and email.
-    if not selected_date:     return no_update, no_update, "⚠️ Please select a date from the calendar first.", no_update
+    if not selected_date:     return no_update, no_update, "⚠️ Please select a date from the calendar first.", no_update, no_update, no_update, no_update
 
     rpe = 3.0 if rpe is None else float(rpe)
     session_quality = 3.0 if session_quality is None else float(session_quality)
@@ -6747,14 +6929,14 @@ def save_and_ai(
 
     df = load_tab(athlete_name)
     if df is None or df.empty or "Date" not in df.columns:
-        return no_update, no_update, "⚠️ Athlete sheet missing or has no Date column.", no_update
+        return no_update, no_update, "⚠️ Athlete sheet missing or has no Date column.", no_update, no_update, no_update, no_update
 
     df = df.copy()
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.date
 
     selected_date_dt = pd.to_datetime(selected_date, errors="coerce")
     if pd.isna(selected_date_dt):
-        return no_update, no_update, "⚠️ Selected date is invalid.", no_update
+        return no_update, no_update, "⚠️ Selected date is invalid.", no_update, no_update, no_update, no_update
     selected_date_dt = selected_date_dt.date()
 
     row_matches = df.index[df["Date"] == selected_date_dt].tolist()
@@ -6781,7 +6963,7 @@ def save_and_ai(
                 row_matches = df.index[df["Date"] == selected_date_dt].tolist()
                 if row_matches: row_idx = row_matches[0]
         except Exception as e:
-            return no_update, no_update, f"❌ Could not create row: {e}", no_update
+            return no_update, no_update, f"❌ Could not create row: {e}", no_update, no_update, no_update, no_update
     else:
         row_idx = row_matches[0]
         row = df.iloc[row_idx]
@@ -6808,26 +6990,8 @@ def save_and_ai(
             except Exception as e:
                 print(f"⚠️ Could not write session details: {e}")
 
-    # Free-text reps the parser can't read get one AI pass to pull out
-    # distance + times; the original text is kept and a "→ read as" line added.
-    try:
-        _wk = safe(df, row_idx, "Workout", "") if row_idx is not None else ""
-    except Exception:
-        _wk = ""
-    track_reps_times = ai_normalise_track_text(track_reps_times, _wk)
-    sets_reps_load = ai_normalise_gym_text(sets_reps_load, _wk)
-
-    ai1, ai2, ai_mode_1, ai_mode_2, coach_flags = make_ai_suggestions(
-        athlete_name=athlete_name, selected_date=selected_date_dt,
-        session_rpe=rpe, session_quality=session_quality,
-        sleep=sleep, fatigue=fatigue, mood=mood, soreness=soreness,
-        notes=notes, sets_reps_load=sets_reps_load, track_reps_times=track_reps_times,
-        ai_mode_1=ai_mode_1, ai_mode_2=ai_mode_2,
-    )
-    # ai_mode_1 / ai_mode_2 may have just been auto-selected inside
-    # make_ai_suggestions (AGENTIC STEP 1) — everything below that displays,
-    # stores, or emails the mode name uses these resolved values.
-
+    # 1. Save what the athlete entered straight away, so nothing is lost and they
+    #    aren't left waiting. The AI feedback is written afterwards, in the background.
     unplanned_extras = {}
     if unplanned_workout and unplanned_workout.strip(): unplanned_extras["Workout"] = unplanned_workout.strip()
     if unplanned_focus and unplanned_focus.strip():   unplanned_extras["Focus"] = unplanned_focus.strip()
@@ -6843,78 +7007,193 @@ def save_and_ai(
         "RPE_Post_Session": rpe, "Session_1_5": session_quality,
         "Sleep_1_5": sleep, "Fatigue_1_5": fatigue, "Mood_1_5": mood, "Soreness_1_5": soreness,
         "Athlete_Notes": notes, "Sets_Reps_Load": sets_reps_load, "Track_Reps_Times": track_reps_times,
-        "AI_Suggestion_1": f"[{ai_mode_1}] {ai1}",
-        "AI_Suggestion_2": f"[{ai_mode_2}] {ai2}",
+        # Cleared now and filled when the new feedback is ready (lets any server copy see it's done).
+        "AI_Suggestion_1": "", "AI_Suggestion_2": "",
+        # Whether the athlete chose the feedback lenses themselves or kept the app's selection.
+        "AI_Lens_Source": "athlete" if lens_pick.get("manual") else "app",
         "Last_Updated": dt.datetime.now().isoformat(timespec="seconds"),
     }
     # FIX #1: only overwrite sRPE with the athlete's post-session actual RPE
-    # if this row did NOT just get a planned sRPE from the unplanned-session
-    # form. Previously this line ran unconditionally, silently clobbering the
-    # planned sRPE (and therefore Load = sRPE × Duration) that was written a
-    # few lines above for unplanned sessions.
+    # if this row did NOT just get a planned sRPE from the unplanned-session form.
     if not (unplanned_srpe and str(unplanned_srpe).strip()):
         payload["sRPE"] = actual_rpe_10
 
     try:
         write_row(athlete_name, row_idx, payload)
     except Exception as e:
-        return no_update, no_update, f"❌ Save failed: {e}", no_update
+        return no_update, no_update, f"❌ Save failed: {e}", no_update, no_update, no_update, no_update
 
-    athlete_email = safe(df, row_idx, "Athlete_email") if "Athlete_email" in df.columns else ""
-    athlete_display = safe(df, row_idx, "Athlete", athlete_name)
-    focus_val = safe(df, row_idx, "Focus", "")
-    venue_val = safe(df, row_idx, "Venue", "")
-    workout_val = safe(df, row_idx, "Workout", "")
-    status_msg = "✅ Saved, ADPTVV insights generated & email sent to Coach."
+    # 2. Start the feedback in the background.
+    job_id = start_feedback_job(dict(
+        athlete_name=athlete_name, row_idx=row_idx, selected_date=selected_date_dt,
+        rpe=rpe, session_quality=session_quality, sleep=sleep, fatigue=fatigue, mood=mood,
+        soreness=soreness, notes=notes, sets_reps_load=sets_reps_load, track_reps_times=track_reps_times,
+        ai_mode_1=ai_mode_1, ai_mode_2=ai_mode_2,
+        workout=safe(df, row_idx, "Workout", "") if row_idx is not None else "",
+    ))
+    status = html.Span("✅ Session saved. Writing your feedback…",
+                       style={"color": "#2E7D32", "fontWeight": 600})
+    job = {"id": job_id, "athlete": athlete_name, "row": int(row_idx), "date": str(selected_date_dt),
+           "started": time.time()}
+    return (feedback_waiting_card(), None, status, (refresh_n or 0) + 1, job, False, True)
 
-    coach3_email = safe(df, row_idx, "Coach_email3") if "Coach_email3" in df.columns else ""
+
+# ============================================================
+#  Background feedback
+#  The session is saved first; the two AI cards are written here, in a thread,
+#  and the page checks every 2 s (ai-poll) until they're ready.
+# ============================================================
+
+_ai_jobs = {}                       # job id -> {"status", "started", ...}
+_ai_jobs_lock = _threading.Lock()
+AI_JOB_TIMEOUT = 180                # seconds before the page stops waiting
+
+
+def start_feedback_job(args: dict) -> str:
+    job_id = hashlib.sha1(f"{args['athlete_name']}|{args['selected_date']}|{time.time()}".encode()).hexdigest()[:16]
+    with _ai_jobs_lock:
+        # forget jobs older than an hour
+        for k in [k for k, j in _ai_jobs.items() if time.time() - j["started"] > 3600]:
+            _ai_jobs.pop(k, None)
+        _ai_jobs[job_id] = {"status": "running", "started": time.time()}
+    _threading.Thread(target=_run_feedback_job, args=(job_id, args), daemon=True).start()
+    return job_id
+
+
+def _run_feedback_job(job_id: str, a: dict):
     try:
-        send_email_payload({
-            "sheet_name": athlete_name, "row": row_idx + 1,
-            "Athlete": athlete_display, "Date": str(selected_date_dt),
-            "Focus": focus_val, "Venue": venue_val, "Workout": workout_val,
-            "RPE_Post_Session": rpe, "Session_1_5": session_quality,
-            "Sleep_1_5": sleep, "Fatigue_1_5": fatigue, "Mood_1_5": mood, "Soreness_1_5": soreness,
-            "Athlete_Notes": notes, "Sets_Reps_Load": sets_reps_load, "Track_Reps_Times": track_reps_times,
-            "AI_Suggestion_1": ai1, "AI_Suggestion_2": ai2, "Athlete_email": athlete_email,
-            "Coach_email3": coach3_email,
-            "AI_Mode_1": ai_mode_1, "AI_Mode_2": ai_mode_2,
-        })
+        # Free-text reps the parser can't read get one AI pass to pull out
+        # distance + times; the original text is kept and a "→ read as" line added.
+        track = ai_normalise_track_text(a["track_reps_times"], a["workout"])
+        gym = ai_normalise_gym_text(a["sets_reps_load"], a["workout"])
+
+        ai1, ai2, m1, m2, _flags = make_ai_suggestions(
+            athlete_name=a["athlete_name"], selected_date=a["selected_date"],
+            session_rpe=a["rpe"], session_quality=a["session_quality"],
+            sleep=a["sleep"], fatigue=a["fatigue"], mood=a["mood"], soreness=a["soreness"],
+            notes=a["notes"], sets_reps_load=gym, track_reps_times=track,
+            ai_mode_1=a["ai_mode_1"], ai_mode_2=a["ai_mode_2"],
+        )
+        upd = {"AI_Suggestion_1": f"[{m1}] {ai1}", "AI_Suggestion_2": f"[{m2}] {ai2}",
+               "Last_Updated": dt.datetime.now().isoformat(timespec="seconds")}
+        if track != a["track_reps_times"]:
+            upd["Track_Reps_Times"] = track
+        if gym != a["sets_reps_load"]:
+            upd["Sets_Reps_Load"] = gym
+        write_row(a["athlete_name"], a["row_idx"], upd)
+
+        status_msg = "✅ Saved, ADPTVV insights generated & email sent to Coach."
+        try:
+            df = load_tab_cached(a["athlete_name"])
+            r = a["row_idx"]
+            send_email_payload({
+                "sheet_name": a["athlete_name"], "row": r + 1,
+                "Athlete": safe(df, r, "Athlete", a["athlete_name"]), "Date": str(a["selected_date"]),
+                "Focus": safe(df, r, "Focus", ""), "Venue": safe(df, r, "Venue", ""),
+                "Workout": safe(df, r, "Workout", ""),
+                "RPE_Post_Session": a["rpe"], "Session_1_5": a["session_quality"],
+                "Sleep_1_5": a["sleep"], "Fatigue_1_5": a["fatigue"], "Mood_1_5": a["mood"],
+                "Soreness_1_5": a["soreness"],
+                "Athlete_Notes": a["notes"], "Sets_Reps_Load": gym, "Track_Reps_Times": track,
+                "AI_Suggestion_1": ai1, "AI_Suggestion_2": ai2,
+                "Athlete_email": safe(df, r, "Athlete_email") if "Athlete_email" in df.columns else "",
+                "Coach_email3": safe(df, r, "Coach_email3") if "Coach_email3" in df.columns else "",
+                "AI_Mode_1": m1, "AI_Mode_2": m2,
+            })
+        except Exception as e:
+            status_msg = f"⚠️ Saved + ADPTVV insights generated, but email failed: {e}"
+        with _ai_jobs_lock:
+            _ai_jobs[job_id].update(status="done", ai1=ai1, ai2=ai2, m1=m1, m2=m2, msg=status_msg)
     except Exception as e:
-        status_msg = f"⚠️ Saved + ADPTVV insights generated, but email failed: {e}"
+        print(f"❌ Feedback job failed: {e}")
+        with _ai_jobs_lock:
+            _ai_jobs[job_id].update(status="error", msg=f"⚠️ Session saved, but feedback couldn't be written: {e}")
 
-    ai1_div = html.Div(html.Div([
-        html.Div([
-            html.Span("ADPTVV Insight 1", className="ai-title",
-                      style={"display": "inline", "verticalAlign": "middle"}),
-            html.Span(f" · {ai_mode_1.replace(' Coach', '')}", style={
-                "fontSize": "11px", "color": "#2E7D32", "fontWeight": "600",
-                "background": "#e8f5e9", "padding": "2px 8px",
-                "borderRadius": "999px", "marginLeft": "8px",
-                "verticalAlign": "middle", "display": "inline-block",
-            }),
-        ], style={"marginBottom": "8px", "lineHeight": "1.6"}),
-        html.P(ai1, style={"margin": 0})
-    ], className="ai-card ai-card-green"))
 
-    ai2_div = html.Div(html.Div([
-        html.Div([
-            html.Span("ADPTVV Insight 2", className="ai-title",
-                      style={"display": "inline", "verticalAlign": "middle"}),
-            html.Span(f" · {ai_mode_2.replace(' Coach', '')}", style={
-                "fontSize": "11px", "color": "#1565C0", "fontWeight": "600",
-                "background": "#e3f2fd", "padding": "2px 8px",
-                "borderRadius": "999px", "marginLeft": "8px",
-                "verticalAlign": "middle", "display": "inline-block",
-            }),
-        ], style={"marginBottom": "8px", "lineHeight": "1.6"}),
-        html.P(ai2, style={"margin": 0})
-    ], className="ai-card ai-card-blue"))
+def feedback_waiting_card():
+    return html.Div([
+        html.Div([html.Div(className="chat-ekg-line")], className="chat-ekg"),
+        html.Div([html.Span("Reading your session…"), html.Span("Checking your trends…"),
+                  html.Span("Writing your feedback…")], className="chat-think-txt"),
+    ], className="fb-wait")
 
-    return ai1_div, ai2_div, html.Span(
-        status_msg,
-        style={"color": "#2E7D32" if status_msg.startswith("✅") else "#C62828", "fontWeight": 600}
-    ), (refresh_n or 0) + 1
+
+def split_lens(text: str):
+    """'[Recovery & Readiness Coach] Sam, …' -> ('Recovery & Readiness Coach', 'Sam, …')"""
+    m = re.match(r"^\[(.+?)\]\s*", str(text or ""))
+    return (m.group(1), text[m.end():]) if m else ("", str(text or ""))
+
+
+def lens_badge(mode: str):
+    info = LENS_INFO.get(mode)
+    if not info:
+        return html.Span(mode.replace(" Coach", ""), className="fb-badge",
+                         style={"color": "var(--text-muted)", "border": "1px solid var(--border)"}) if mode else None
+    return html.Span([html.I(className=f"bi bi-{info['icon']}"), info["q"]], className="fb-badge",
+                     style={"color": info["col"], "background": info["col"] + "22",
+                            "border": "1px solid " + info["col"] + "66"})
+
+
+def feedback_card(n: int, mode: str, text: str):
+    return html.Div(html.Div([
+        html.Div([html.Span(f"ADPTVV Insight {n}", className="ai-title"), lens_badge(mode)], className="fb-head"),
+        html.P(text, style={"margin": 0}),
+    ], className="ai-card " + ("ai-card-green" if n == 1 else "ai-card-blue")))
+
+
+@app.callback(
+    Output("ai-suggestion-1", "children", allow_duplicate=True),
+    Output("ai-suggestion-2", "children", allow_duplicate=True),
+    Output("save-status", "children", allow_duplicate=True),
+    Output("ai-poll", "disabled", allow_duplicate=True),
+    Output("btn-generate-ai", "disabled", allow_duplicate=True),
+    Output("refresh-btn", "n_clicks", allow_duplicate=True),
+    Input("ai-poll", "n_intervals"),
+    State("ai-job", "data"),
+    State("refresh-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def poll_feedback(_n, job, refresh_n):
+    if not job or not job.get("id"):
+        return no_update, no_update, no_update, True, False, no_update
+    with _ai_jobs_lock:
+        j = dict(_ai_jobs.get(job["id"], {}))
+    waited = time.time() - float(job.get("started") or time.time())
+
+    def _status(msg):
+        return html.Span(msg, style={"color": "#2E7D32" if msg.startswith("✅") else "#C62828", "fontWeight": 600})
+
+    if j.get("status") == "done":
+        return (feedback_card(1, j["m1"], j["ai1"]),
+                feedback_card(2, j["m2"], j["ai2"]),
+                _status(j["msg"]), True, False, (refresh_n or 0) + 1)
+    if j.get("status") == "error":
+        return None, None, _status(j["msg"]), True, False, no_update
+
+    # Job not on this server copy (e.g. Render runs more than one): check the sheet every ~6 s.
+    if not j and int(_n or 0) % 3 == 0:
+        try:
+            df = load_tab(job["athlete"])
+            r = int(job["row"])
+            a1, a2 = safe(df, r, "AI_Suggestion_1", ""), safe(df, r, "AI_Suggestion_2", "")
+            if a1.strip() and a2.strip():
+                m1, t1 = split_lens(a1)
+                m2, t2 = split_lens(a2)
+                _invalidate_tab(job["athlete"])
+                return (feedback_card(1, m1, t1),
+                        feedback_card(2, m2, t2),
+                        _status("✅ Saved, ADPTVV insights generated."), True, False, (refresh_n or 0) + 1)
+        except Exception:
+            pass
+
+    if waited > AI_JOB_TIMEOUT:
+        return (None, None, _status("⚠️ Session saved. Feedback is taking longer than usual — "
+                                    "it will show in your calendar for this day when it's ready."),
+                True, False, no_update)
+    raise PreventUpdate
+
+
+
 
 
 @app.callback(
@@ -8342,6 +8621,453 @@ def _build_welcome(athlete_id):
               "padding": "0 8px", "background": "transparent", "border": "none"})
 
 
+# ============================================================
+#  Share card (Strava-style): three templates drawn on one canvas in the
+#  browser — Session (title, big stats, rep splits), Readiness and Week —
+#  over a gradient, the athlete's own photo, or a transparent sticker.
+# ============================================================
+
+SHARE_CARD_HTML = r"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:ital,wght@0,500;0,600;0,700;0,800;1,500;1,600&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#111;font-family:'Barlow Condensed',system-ui,sans-serif;color:#fff;display:flex;flex-direction:column;
+  align-items:center;padding:10px 12px 16px;overflow-x:hidden;-webkit-tap-highlight-color:transparent}
+.tabs{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;width:100%;max-width:360px;margin-bottom:10px}
+.tabs::-webkit-scrollbar{display:none}
+.tab{min-height:36px;padding:0 8px;border-radius:999px;border:1px solid rgba(255,255,255,.16);background:transparent;
+  color:rgba(255,255,255,.72);font:600 15.5px 'Barlow Condensed',system-ui;letter-spacing:.02em;cursor:pointer;white-space:nowrap}
+.tab.on{background:#fff;color:#111;border-color:#fff}
+#stage{width:100%;max-width:min(330px,calc((100vh - 290px) * .9));border-radius:16px;overflow:hidden;padding:14px;display:flex;align-items:center;justify-content:center;
+  min-height:220px;background:repeating-conic-gradient(#2a2a2a 0% 25%,#333 0% 50%) 50%/24px 24px;transition:background .2s}
+#stage.light{background:repeating-conic-gradient(#cfd4d8 0% 25%,#e3e7ea 0% 50%) 50%/24px 24px}
+#cv{width:100%;height:auto;display:block}
+.sub{display:flex;justify-content:space-between;align-items:center;width:100%;max-width:330px;margin-top:8px;
+  font:500 12.5px system-ui;color:rgba(255,255,255,.5)}
+.inks{display:flex;gap:6px}
+.ink{background:none;border:1px solid rgba(255,255,255,.18);color:rgba(255,255,255,.7);border-radius:999px;padding:5px 12px;
+  font:600 14px 'Barlow Condensed',system-ui;cursor:pointer}
+.ink.on{background:#fff;color:#111;border-color:#fff}
+#shareBtn{width:100%;max-width:330px;margin-top:10px;min-height:50px;border:none;border-radius:14px;
+  background:linear-gradient(135deg,#3fb6d6,#2a82aa);color:#fff;font:700 19px 'Barlow Condensed',system-ui;letter-spacing:.03em;
+  cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px}
+#shareBtn:disabled{opacity:.6}
+#hint{max-width:330px;text-align:center;font:500 12px system-ui;color:rgba(255,255,255,.42);margin-top:8px;line-height:1.45}
+</style></head><body>
+<div class="tabs" id="tabs"></div>
+<div id="stage"><canvas id="cv" width="1080" height="1000"></canvas></div>
+<div class="sub"><span>Transparent sticker · text colour</span>
+  <span class="inks"><button class="ink on" data-ink="white">White</button><button class="ink" data-ink="black">Black</button></span></div>
+<button id="shareBtn">
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12v7a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-7"/><polyline points="16 6 12 2 8 6"/><line x1="12" y1="2" x2="12" y2="15"/></svg>
+  <span>Share sticker</span></button>
+<div id="hint">Saves with a see-through background. In Instagram Stories, pick your photo, then add this as a sticker
+  (Stickers → Photo, or copy and paste it) and drag it where you want.</div>
+<script>
+const D = __DATA__;
+const LOGO = "__LOGO__";
+const W = 1080, PAD = 60;
+const ACC = "#3fb6d6", ACC2 = "#2a82aa";            // ADPTVV logo teal / deeper blue
+const F = "'Barlow Condensed', system-ui, sans-serif";
+let ink = 'white';                                    // sticker text colour: 'white' or 'black'
+const FG = () => ink === 'white' ? '#fff' : '#0b0f14';
+const FGA = a => ink === 'white' ? `rgba(255,255,255,${a})` : `rgba(11,15,20,${Math.min(1, a + .1)})`;
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+let logoImg = null;
+if (LOGO) { logoImg = new Image(); logoImg.onload = () => draw(); logoImg.src = LOGO; }
+
+const TABS = [
+  ['track', 'Track', !!D.track], ['gym', 'Gym', !!D.gym], ['dials', 'Dials', true],
+  ['week', 'Training week', !!D.week], ['quote', 'Motivational', !!D.quote], ['well', 'Wellness', !!D.well],
+].filter(t => t[2]);
+let tpl = TABS[0][0];
+
+/* ---------- helpers (every mark gets a soft shadow so it reads on any photo) ---------- */
+function shadow(on) { on = on && ink === 'white'; ctx.shadowColor = on ? 'rgba(0,0,0,.6)' : 'transparent'; ctx.shadowBlur = on ? 16 : 0; ctx.shadowOffsetY = on ? 2 : 0; }
+function font(w, px, it) { ctx.font = (it ? 'italic ' : '') + w + ' ' + px + 'px ' + F; }
+function txt(s, x, y, w, px, col, align, it) { font(w, px, it); ctx.fillStyle = col || FG(); ctx.textAlign = align || 'left'; ctx.textBaseline = 'alphabetic'; ctx.fillText(s, x, y); }
+function spaced(s, x, y, px, col, sp, align) {
+  font(600, px); ctx.fillStyle = col; ctx.textBaseline = 'alphabetic'; ctx.textAlign = 'left';
+  const cs = String(s).toUpperCase().split(''); const tot = cs.reduce((a, c) => a + ctx.measureText(c).width + sp, -sp);
+  let cx = align === 'center' ? x - tot / 2 : (align === 'right' ? x - tot : x);
+  for (const c of cs) { ctx.fillText(c, cx, y); cx += ctx.measureText(c).width + sp; }
+}
+function fitPx(s, w, px, maxW, minPx, it) { let p = px; font(w, p, it); while (ctx.measureText(s).width > maxW && p > minPx) { p -= 4; font(w, p, it); } return p; }
+function wrap(s, maxW, w, px, it) {
+  font(w, px, it); const out = []; let line = '';
+  for (const wd of String(s).split(' ')) { const t = line ? line + ' ' + wd : wd;
+    if (ctx.measureText(t).width > maxW && line) { out.push(line); line = wd; } else line = t; }
+  if (line) out.push(line); return out;
+}
+function rr(x, y, w, h, r) { ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(x, y, w, h, r); else ctx.rect(x, y, w, h); }
+function setH(h) { cv.height = Math.round(h); ctx.clearRect(0, 0, W, cv.height); shadow(true); }
+
+function brand(y, right) {
+  const sz = 50; let x = PAD;
+  if (logoImg && logoImg.naturalWidth) {
+    const oc = document.createElement('canvas'); oc.width = sz; oc.height = sz; const o = oc.getContext('2d');
+    o.drawImage(logoImg, 0, 0, sz, sz); o.globalCompositeOperation = 'source-in'; o.fillStyle = FG(); o.fillRect(0, 0, sz, sz);
+    ctx.drawImage(oc, x, y, sz, sz); x += sz + 14;
+  }
+  spaced('ADPTVV', x, y + sz / 2 + 13, 36, FG(), 6);
+  if (right) {                                   // e.g. NEW PB badge, top right
+    font(700, 34); const w = ctx.measureText(right).width + 44;
+    ctx.fillStyle = ACC2; rr(W - PAD - w, y - 2, w, 56, 28); ctx.fill();
+    shadow(false); txt(right, W - PAD - w + 22, y + 38, 700, 34, '#ffffff'); shadow(true);
+  }
+}
+function heading(when, title, sub, y) {          // returns the y below it
+  txt(when, PAD, y, 600, 38, FGA(.92));
+  let yy = y + 104;
+  wrap(title, W - PAD * 2, 800, 108).slice(0, 2).forEach((l, i) => {
+    const p = fitPx(l, 800, 108, W - PAD * 2, 64); txt(l, PAD, yy + i * 102, 800, p, FG()); if (i) yy += 102; });
+  if (sub) { txt(sub, PAD, yy + 56, 500, 36, FGA(.85)); yy += 56; }
+  return yy;
+}
+function statRow(stats, y) {                     // label above, big value, small unit
+  const n = stats.length; if (!n) return; const colW = (W - PAD * 2) / n;
+  stats.forEach((s, i) => {
+    const x = PAD + colW * i, lx = i ? x + 30 : x;
+    if (i) { ctx.fillStyle = FGA(.4); ctx.fillRect(x - 1, y - 52, 3, 132); }
+    spaced(s.label, lx, y - 20, 30, FGA(.9), 3);
+    const maxW = colW - (i ? 60 : 30); let vp = 108;
+    const uw = () => { font(600, Math.round(vp * .42)); return s.unit ? ctx.measureText(' ' + s.unit).width : 0; };
+    font(700, vp); while (ctx.measureText(s.value).width + uw() > maxW && vp > 48) { vp -= 4; font(700, vp); }
+    txt(s.value, lx, y + 76, 700, vp, s.hi ? ACC : FG()); font(700, vp); const vw = ctx.measureText(s.value).width;
+    if (s.unit) txt(' ' + s.unit, lx + vw, y + 76, 600, Math.round(vp * .42), FGA(.9));
+  });
+}
+function ring(cx, cy, r, sw, pct, col, val, label, vpx, lpx) {
+  ctx.lineWidth = sw;
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.strokeStyle = FGA(.28); ctx.stroke();
+  if (pct > 0) { ctx.beginPath(); ctx.arc(cx, cy, r, -Math.PI / 2, -Math.PI / 2 + Math.min(pct, 100) / 100 * Math.PI * 2);
+    ctx.strokeStyle = col; ctx.lineCap = 'round'; ctx.stroke(); ctx.lineCap = 'butt'; }
+  txt(String(val), cx, cy + vpx * .36, 700, vpx, FG(), 'center');
+  if (label) spaced(label, cx, cy + r + lpx + 28, lpx, FGA(.9), 3, 'center');
+}
+
+/* ---------- 1. Track ---------- */
+function drawTrack() {
+  const T = D.track, reps = T.splits.slice(0, 12), n = reps.length;
+  setH(1180); brand(PAD, T.badge);
+  let y = heading(T.when, T.title, T.sub, 210);
+  const sy = y + 150; statRow(T.stats, sy);
+  const cy = sy + 175; spaced(T.splits_title, PAD, cy, 28, FGA(.9), 3);
+  const top = cy + 34, h = 290, base = top + h;
+  const gap = n > 8 ? 14 : 24, bw = Math.min(160, (W - PAD * 2 - gap * (n - 1)) / n), tot = bw * n + gap * (n - 1);
+  const sp = reps.map(r => 1 / r.t), mx = Math.max(...sp), mn = Math.min(...sp), best = Math.min(...reps.map(r => r.t));
+  let x = PAD;
+  reps.forEach(r => {
+    const k = mx === mn ? 1 : .35 + .65 * (1 / r.t - mn) / (mx - mn), bh = Math.max(14, k * (h - 50)), b = r.t === best;
+    ctx.fillStyle = b ? ACC : FG(); rr(x, base - bh, bw, bh, Math.min(10, bw / 3)); ctx.fill();
+    txt(r.lab, x + bw / 2, base - bh - 12, b ? 700 : 600, n > 8 ? 28 : 34, b ? ACC : FG(), 'center');
+    x += bw + gap;
+  });
+  ctx.fillStyle = FGA(.5); ctx.fillRect(PAD, base + 6, tot, 3);
+  setFinal(base + 40);
+}
+
+/* ---------- 2. Gym ---------- */
+function drawGym() {
+  const G = D.gym, L = G.lifts.slice(0, 4);
+  setH(1300); brand(PAD, G.badge);
+  let y = heading(G.when, G.title, G.sub, 210);
+  const sy = y + 150; statRow(G.stats, sy);
+  let ly = sy + 175; spaced('Top sets', PAD, ly, 28, FGA(.9), 3); ly += 44;
+  L.forEach(l => {
+    txt(l.name, PAD, ly + 36, 600, 42, FG()); txt(l.txt, W - PAD, ly + 36, 700, 42, l.hi ? ACC : FG(), 'right');
+    ctx.fillStyle = FGA(.3); rr(PAD, ly + 56, W - PAD * 2, 14, 7); ctx.fill();
+    const p = Math.max(.06, Math.min(1, (l.pct || 60) / 100));
+    ctx.fillStyle = l.hi ? ACC : FG(); rr(PAD, ly + 56, (W - PAD * 2) * p, 14, 7); ctx.fill();
+    if (l.pct) txt(l.pct + '% of PB', W - PAD, ly + 108, 500, 28, FGA(.85), 'right');
+    ly += 124;
+  });
+  setFinal(ly + 10);
+}
+
+/* ---------- 3. Dials ---------- */
+function drawDials() {
+  const R = D.ready;
+  setH(1260); brand(PAD);
+  txt(D.today, PAD, 210, 600, 38, FGA(.92));
+  const cx = W / 2, cy = 520;
+  ring(cx, cy, 210, 40, R.r, '#1E88E5', R.r, '', 150, 0);
+  spaced('Daily readiness', cx, cy + 290, 32, FGA(.95), 4, 'center');
+  txt(R.verdict, cx, cy + 360, 700, 60, R.vc, 'center');
+  const y2 = cy + 560, sp = (W - PAD * 2) / 3;
+  [[R.n, 'Neuro', '#43A047', R.n], [R.e, 'Exposure', '#FB8C00', R.e + '%'], [R.sp, 'Streak', '#E91E8C', R.s]].forEach((d, i) =>
+    ring(PAD + sp * i + sp / 2, y2, 92, 18, d[0], d[2], d[3], d[1], 64, 26));
+  setFinal(y2 + 92 + 80);
+}
+
+/* ---------- 4. Training week ---------- */
+function drawWeek() {
+  const K = D.week;
+  setH(1300); brand(PAD);
+  let y = heading(K.range, 'My training week', '', 210);
+  const sy = y + 150; statRow(K.stats, sy);
+  const top = sy + 190, base = top + 420, n = K.days.length, gap = 24;
+  const bw = (W - PAD * 2 - gap * (n - 1)) / n, mx = Math.max(1, ...K.days.map(d => d.load || 0));
+  K.days.forEach((d, i) => {
+    const x = PAD + i * (bw + gap);
+    ctx.fillStyle = FGA(.22); rr(x, top, bw, base - top, 14); ctx.fill();
+    if (d.load) { const bh = Math.max(16, (base - top) * d.load / mx);
+      ctx.fillStyle = d.today ? ACC : FG(); rr(x, base - bh, bw, bh, 14); ctx.fill(); }
+    txt(d.lab, x + bw / 2, base + 62, 700, 40, d.today ? ACC : FG(), 'center');
+    if (d.logged) { ctx.fillStyle = d.today ? ACC : FG(); ctx.beginPath(); ctx.arc(x + bw / 2, base + 98, 9, 0, Math.PI * 2); ctx.fill(); }
+  });
+  let fy = base + 160;
+  if (K.line) { wrap(K.line, W - PAD * 2, 600, 44).slice(0, 2).forEach((l, i) => txt(l, PAD, fy + i * 56, 600, 44, FG())); fy += 56 * Math.min(2, wrap(K.line, W - PAD * 2, 600, 44).length); }
+  setFinal(fy);
+}
+
+/* ---------- 5. Motivational ---------- */
+function drawQuote() {
+  const Q = D.quote;
+  setH(1200); brand(PAD);
+  // big teal quote mark, then the line itself
+  txt('“', PAD - 6, 330, 800, 260, ACC);
+  let px = 92, lines = wrap(Q.text, W - PAD * 2, 700, px, true);
+  while (lines.length > 5 && px > 56) { px -= 6; lines = wrap(Q.text, W - PAD * 2, 700, px, true); }
+  let y = 360; lines.forEach(l => { txt(l, PAD, y, 700, px, FG(), 'left', true); y += px * 1.12; });
+  ctx.fillStyle = ACC; ctx.fillRect(PAD, y + 10, 90, 8);
+  txt(Q.by, PAD, y + 80, 600, 40, FG());
+  setFinal(y + 110);
+}
+
+/* ---------- 6. Wellness ---------- */
+function drawWell() {
+  const K = D.well;
+  setH(1300); brand(PAD);
+  let y = heading(K.when, 'Wellness check-in', '', 210);
+  y += 70;
+  K.rows.forEach(r => {
+    txt(r.label, PAD, y + 40, 700, 52, FG());
+    if (r.note) { font(700, 52); const lw = ctx.measureText(r.label).width; txt(r.note, PAD + lw + 14, y + 40, 500, 28, FGA(.8)); }
+    txt(r.value + '', W - PAD - 64, y + 40, 700, 60, r.good === false ? '#f5b301' : ACC, 'right');
+    txt('/5', W - PAD, y + 40, 600, 30, FGA(.9), 'right');
+    const segW = (W - PAD * 2 - 4 * 12) / 5;
+    for (let i = 0; i < 5; i++) {
+      ctx.fillStyle = i < r.value ? (r.good === false ? '#f5b301' : ACC) : FGA(.28);
+      rr(PAD + i * (segW + 12), y + 64, segW, 22, 11); ctx.fill();
+    }
+    if (r.avg != null) txt('7-day average ' + r.avg, PAD, y + 128, 500, 30, FGA(.85));
+    y += 176;
+  });
+  setFinal(y + 10);
+}
+
+/* crop the canvas to what was drawn, so the sticker has no empty space */
+function setFinal(h) {
+  const hh = Math.round(h); if (hh >= cv.height) return;
+  const img = ctx.getImageData(0, 0, W, hh); cv.height = hh; ctx.putImageData(img, 0, 0);
+}
+
+function draw() {
+  ({track: drawTrack, gym: drawGym, dials: drawDials, week: drawWeek, quote: drawQuote, well: drawWell}[tpl] || drawDials)();
+}
+
+/* ---------- controls ---------- */
+const tabsEl = document.getElementById('tabs');
+TABS.forEach(([k, label]) => { const b = document.createElement('button'); b.className = 'tab'; b.textContent = label; b.dataset.t = k;
+  b.onclick = () => { tpl = k; document.querySelectorAll('.tab').forEach(x => x.classList.toggle('on', x.dataset.t === k)); draw(); };
+  tabsEl.appendChild(b); });
+tabsEl.firstChild.classList.add('on');
+document.querySelectorAll('.ink').forEach(b => b.onclick = () => {
+  ink = b.dataset.ink;
+  document.querySelectorAll('.ink').forEach(x => x.classList.toggle('on', x === b));
+  document.getElementById('stage').classList.toggle('light', ink === 'black');
+  draw();
+});
+const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+document.getElementById('shareBtn').onclick = async function () {
+  const btn = this; btn.disabled = true; draw();
+  const name = 'adptvv-' + tpl + '-' + D.file + '.png';
+  const blob = await new Promise(r => cv.toBlob(r, 'image/png'));
+  try {
+    const file = new File([blob], name, {type: 'image/png'});
+    if (navigator.canShare && navigator.canShare({files: [file]})) { await navigator.share({files: [file]}); btn.disabled = false; return; }
+  } catch (err) { if (err && err.name === 'AbortError') { btn.disabled = false; return; } }
+  const url = cv.toDataURL('image/png');
+  if (isIOS) { const tab = window.open();
+    if (tab) { tab.document.write('<html><head><meta name="viewport" content="width=device-width"></head><body style="margin:0;background:#555;display:flex;flex-direction:column;align-items:center;padding:16px;font-family:system-ui"><p style="color:#fff;font-size:14px;margin-bottom:12px">Long-press the image → Save to Photos</p><img src="' + url + '" style="max-width:100%"/></body></html>'); tab.document.close(); }
+  } else { const a = document.createElement('a'); a.download = name; a.href = url; a.click(); }
+  btn.disabled = false;
+};
+draw();
+if (document.fonts && document.fonts.load) {
+  Promise.race([Promise.all(["800 108px", "700 108px", "600 38px", "italic 700 92px", "500 36px"].map(f => document.fonts.load(f + " 'Barlow Condensed'"))),
+    new Promise(r => setTimeout(r, 2500))]).then(draw);
+}
+</script>
+</body></html>
+"""
+
+_SKIP_WORKOUT = re.compile(r"^\s*(pre|warm ?up|wu|aad)\b", re.I)
+
+
+def share_title(workout: str, focus: str = "") -> str:
+    """'PRE: AAD Warmup 1 / TRACK: Blocks' -> 'Blocks'. Falls back to the focus, then 'Training session'."""
+    parts = [p.strip() for p in re.split(r"\s*/\s*|\s*\|\s*", str(workout or "")) if p.strip()]
+    parts = [p for p in parts if not _SKIP_WORKOUT.match(p)] or parts
+    t = parts[0] if parts else ""
+    t = re.sub(r"^[A-Za-z ]{2,12}:\s*", "", t).strip()
+    if t.lower() in ("", "nan", "none", "nil", "tbc", "unplanned session"):
+        t = str(focus or "").strip()
+        t = f"{t} session" if t and t.lower() not in ("nan", "none") else "Training session"
+    if t.isupper() and len(t) > 4:
+        t = t.title()
+    return t[:40]
+
+
+def _share_recent_row(df: pd.DataFrame, today: dt.date, col: str, days: int = 7):
+    """Most recent row in the last `days` days with something in `col`, or None."""
+    if df is None or df.empty or "Date" not in df.columns or col not in df.columns:
+        return None
+    d = df.copy()
+    d["_d"] = pd.to_datetime(d["Date"], errors="coerce").dt.date
+    d = d[(d["_d"] <= today) & (d["_d"] >= today - dt.timedelta(days=days - 1))].sort_values("_d")
+    for _, r in d.iloc[::-1].iterrows():
+        if str(r.get(col, "") or "").strip().lower() not in ("", "nan", "none", "nil", "0", "n/a", "-", "—"):
+            return r
+    return None
+
+
+def _share_when(day: dt.date, today: dt.date) -> str:
+    w = "Today" if day == today else ("Yesterday" if day == today - dt.timedelta(days=1)
+                                      else day.strftime("%A"))
+    return w + " · " + day.strftime("%d %b %Y").lstrip("0")
+
+
+def _share_head(row, today):
+    focus = str(row.get("Focus", "") or "").strip()
+    venue = str(row.get("Venue", "") or "").strip()
+    bad = ("", "nan", "none", "nil")
+    return {"title": share_title(row.get("Workout", ""), focus), "when": _share_when(row["_d"], today),
+            "sub": " · ".join(x for x in (focus, venue) if x.lower() not in bad)}
+
+
+def _share_num(row, c):
+    v = pd.to_numeric(row.get(c), errors="coerce")
+    return float(v) if pd.notna(v) and v > 0 else None
+
+
+def share_track_data(df: pd.DataFrame, athlete: str, today: dt.date, pbs: dict):
+    """Track sticker: latest session in the last 7 days with readable rep times."""
+    row = _share_recent_row(df, today, "Track_Reps_Times")
+    reps = parse_track_reps(row.get("Track_Reps_Times", "")) if row is not None else []
+    if not reps:
+        return None
+    counts = {}
+    for ev, _t in reps:
+        counts[ev] = counts.get(ev, 0) + 1
+    order = [r[0] for r in reps]
+    main = max(counts, key=lambda e: (counts[e], -order.index(e)))
+    times = [t for ev, t in reps if ev == main]
+    best = min(times)
+    pb = pbs.get(main, {}).get("value") if pbs.get(main, {}).get("type") == "Track" else None
+    new_pb = bool(pb and best < pb)
+    stats = [{"label": f"Best {main}", "value": fmt_time(best), "unit": "s", "hi": new_pb}]
+    if pb:
+        stats.append({"label": "Of PB pace", "value": f"{pb / best * 100:.0f}", "unit": "%", "hi": new_pb})
+    stats.append({"label": "Reps", "value": str(len(reps)), "unit": ""})
+    rpe = _share_num(row, "RPE_Post_Session")
+    if len(stats) < 3 and rpe:
+        stats.append({"label": "Effort", "value": f"{rpe:g}", "unit": "/5"})
+    return {**_share_head(row, today), "stats": stats[:3], "badge": f"NEW PB · {main}" if new_pb else "",
+            "splits_title": f"{main} reps", "splits": [{"t": t, "lab": fmt_time(t)} for t in times]}
+
+
+def share_gym_data(df: pd.DataFrame, athlete: str, today: dt.date, pbs: dict):
+    """Gym sticker: latest session in the last 7 days with readable lifts."""
+    row = _share_recent_row(df, today, "Sets_Reps_Load")
+    gym = summarise_gym_vs_pb(row.get("Sets_Reps_Load", ""), pbs) if row is not None else []
+    if not gym:
+        return None
+    top = max(gym, key=lambda g: g.get("pct") or 0) if any(g.get("pct") for g in gym) else gym[0]
+    unit = top.get("unit", "kg")
+    stats = [{"label": top["exercise"][:16], "value": f"{top['load']:g}",
+              "unit": f"{unit} × {top['reps']}" if unit == "kg" else unit, "hi": bool(top.get("pct") and top["pct"] > 100)},
+             {"label": "Sets", "value": str(sum(len(g.get("sets", [])) for g in gym)), "unit": ""}]
+    rpe = _share_num(row, "RPE_Post_Session")
+    if rpe:
+        stats.append({"label": "Effort", "value": f"{rpe:g}", "unit": "/5"})
+    lifts = []
+    for g in gym[:4]:
+        u = g.get("unit", "kg")
+        lifts.append({"name": g["exercise"], "pct": round(g["pct"]) if g.get("pct") else None,
+                      "txt": f"{g['load']:g} {u}" + (f" × {g['reps']}" if u == "kg" else ""),
+                      "hi": bool(g.get("pct") and g["pct"] > 100)})
+    hi = next((l["name"] for l in lifts if l["hi"]), "")
+    return {**_share_head(row, today), "stats": stats, "lifts": lifts, "badge": f"NEW PB · {hi}" if hi else ""}
+
+
+def share_wellness_data(df: pd.DataFrame, today: dt.date):
+    """Wellness sticker: latest check-in (last 3 days) with 7-day averages."""
+    if df is None or df.empty or "Date" not in df.columns:
+        return None
+    d = df.copy()
+    d["_d"] = pd.to_datetime(d["Date"], errors="coerce").dt.date
+    d = d[(d["_d"] <= today) & (d["_d"] >= today - dt.timedelta(days=13))].sort_values("_d")
+    cols = [("Sleep_1_5", "Sleep", "", True), ("Fatigue_1_5", "Energy", "", True),
+            ("Mood_1_5", "Mood", "", True), ("Soreness_1_5", "Soreness", "5 = most sore", False)]
+    row = None
+    for _, r in d.iloc[::-1].iterrows():
+        if all(pd.notna(pd.to_numeric(r.get(c), errors="coerce")) for c, *_ in cols):
+            row = r
+            break
+    if row is None or (today - row["_d"]).days > 2:
+        return None
+    week = d[d["_d"] > today - dt.timedelta(days=7)]
+    rows = []
+    for c, label, note, high_good in cols:
+        v = int(round(float(pd.to_numeric(row.get(c), errors="coerce"))))
+        avg = pd.to_numeric(week[c], errors="coerce").dropna() if c in week.columns else pd.Series(dtype=float)
+        good = (v >= 3) if high_good else (v <= 3)
+        rows.append({"label": label, "note": note, "value": v, "good": good,
+                     "avg": f"{avg.mean():.1f}" if len(avg) >= 3 else None})
+    return {"when": _share_when(row["_d"], today), "rows": rows}
+
+
+def share_week_data(df: pd.DataFrame, today: dt.date, streak: int, weekly_pct: int):
+    week_start = today - dt.timedelta(days=(today.weekday() - 5) % 7)      # app weeks run Sat-Fri
+    days, total, logged = [], 0.0, 0
+    d = df.copy() if df is not None and not df.empty else pd.DataFrame(columns=["Date"])
+    if "Date" in d.columns:
+        d["_d"] = pd.to_datetime(d["Date"], errors="coerce").dt.date
+    for i in range(7):
+        day = week_start + dt.timedelta(days=i)
+        rows = d[d["_d"] == day] if "_d" in d.columns else d.iloc[0:0]
+        st = get_day_status(df, day) if not rows.empty else {"logged": False}
+        ld = pd.to_numeric(rows.iloc[-1].get("Load"), errors="coerce") if not rows.empty else np.nan
+        ld = float(ld) if pd.notna(ld) and day <= today else 0.0
+        is_logged = bool(st.get("logged")) and day <= today and bool(
+            pd.notna(pd.to_numeric(rows.iloc[-1].get("RPE_Post_Session"), errors="coerce"))) if not rows.empty else False
+        total += ld
+        logged += int(is_logged)
+        days.append({"lab": day.strftime("%a")[0], "load": round(ld), "logged": is_logged, "today": day == today})
+    planned = count_planned_sessions_in_week(df, week_start, week_start + dt.timedelta(days=6)) if df is not None and not df.empty else 0
+    rng = f"{week_start.strftime('%a %d %b').replace(' 0', ' ')} – {(week_start + dt.timedelta(days=6)).strftime('%a %d %b').replace(' 0', ' ')}"
+    stats = [{"label": "Sessions", "value": str(logged), "unit": f"/ {planned}" if planned else ""},
+             {"label": "Load", "value": f"{total:.0f}", "unit": "AU"},
+             {"label": "Streak", "value": str(streak_cycle(streak)), "unit": "days"}]
+    if planned and logged >= planned:
+        line = "Every planned session logged this week."
+    elif planned:
+        line = f"{logged} of {planned} planned sessions logged so far — {weekly_pct}% exposure."
+    else:
+        line = ""
+    return {"range": rng, "stats": stats, "days": days, "line": line}
+
+
+def build_share_card_html(data: dict, logo_b64: str = "") -> str:
+    js = json.dumps(data).replace("</", "<\\/")
+    return (SHARE_CARD_HTML.replace("__DATA__", js)
+            .replace("__LOGO__", ("data:image/png;base64," + logo_b64) if logo_b64 else ""))
+
+
 @app.callback(
     Output("share-card-modal", "style"),
     Output("share-card-container", "children"),
@@ -8506,9 +9232,7 @@ def show_share_card(n, close_n, athlete_id, current_style):
     except Exception:
         mot_quote = f"Every session builds the athlete you're becoming, {first_name}."
 
-    # Logo is served by Dash from /assets/ — load it in the iframe via URL, no disk read needed
-    # Read logo server-side — no CORS issues, guaranteed to work on Render
-    import base64, os
+    import base64
     logo_b64 = ""
     for _lp in ["assets/app_icon.png", "/app/assets/app_icon.png", "app/assets/app_icon.png"]:
         try:
@@ -8518,378 +9242,35 @@ def show_share_card(n, close_n, athlete_id, current_style):
         except Exception:
             pass
 
-    html_src = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-*{{box-sizing:border-box;margin:0;padding:0}}
-body{{background:#111;font-family:system-ui,sans-serif;display:flex;flex-direction:column;align-items:center;padding:12px;overflow-x:hidden}}
-#previewWrap{{width:100%;max-width:320px;position:relative;touch-action:none;user-select:none}}
-#preview{{width:100%;aspect-ratio:9/16;border-radius:18px;overflow:hidden;position:relative;background:#111;border:1px solid rgba(255,255,255,0.1);transform-origin:center center;will-change:transform}}
-#bgCanvas{{position:absolute;inset:0;width:100%;height:100%;display:block}}
-#scrim{{position:absolute;inset:0;background:linear-gradient(to bottom,rgba(0,0,0,0.12) 0%,rgba(0,0,0,0.04) 30%,rgba(0,0,0,0.55) 58%,rgba(0,0,0,0.82) 100%);pointer-events:none}}
-#card-overlay{{position:absolute;bottom:0;left:0;right:0;padding:16px 18px 22px;pointer-events:none}}
-.topbar{{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}}
-.brand{{font-size:8px;letter-spacing:.16em;color:rgba(255,255,255,.55);text-transform:uppercase;display:flex;align-items:center;gap:5px}}
-.brand img{{width:20px;height:20px;border-radius:3px;object-fit:contain;filter:brightness(0) invert(1);opacity:0.85}}
-.dials{{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:14px}}
-.dials-3{{grid-template-columns:repeat(3,1fr)}}
-.hero-dial{{display:flex;flex-direction:column;align-items:center;gap:2px;margin-bottom:10px}}
-.hero-lbl{{font-size:7px;letter-spacing:.08em;text-transform:uppercase;color:rgba(255,255,255,.5)}}
-.hero-verdict-txt{{font-size:13px;font-weight:700;margin-top:2px}}
-.dial-item{{display:flex;flex-direction:column;align-items:center;gap:4px}}
-.dial-lbl{{font-size:7px;letter-spacing:.05em;text-transform:uppercase;color:rgba(255,255,255,.5);text-align:center}}
-.divider{{height:1px;background:rgba(255,255,255,.15);margin:0 0 12px}}
-.quote{{font-size:12px;font-style:italic;color:rgba(255,255,255,.9);line-height:1.5;text-align:center;padding:0 4px;margin-bottom:14px;text-shadow:0 1px 4px rgba(0,0,0,0.5)}}
-.footer{{display:flex;justify-content:flex-start;align-items:center}}
-.footer-date{{font-size:9px;color:rgba(255,255,255,.32)}}
-#controls{{width:100%;max-width:320px;margin-top:10px;display:flex;flex-direction:column;gap:7px}}
-#photolabel{{display:flex;align-items:center;justify-content:center;gap:7px;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.14);border-radius:10px;padding:10px;cursor:pointer;color:rgba(255,255,255,.65);font-size:11px}}
-#photolabel:hover{{background:rgba(255,255,255,.11)}}
-#photoInput{{display:none}}
-#dlBtn{{background:#1E88E5;border:none;border-radius:10px;padding:11px;color:#fff;font-size:12px;font-weight:600;cursor:pointer;width:100%}}
-#dlBtn:hover{{background:#1565C0}}
-#hint{{text-align:center;font-size:9px;color:rgba(255,255,255,.3);margin-top:2px}}
-#resetBtn{{background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.15);border-radius:10px;padding:8px;color:rgba(255,255,255,0.5);font-size:11px;cursor:pointer;width:100%}}
-</style></head><body>
-<div id="previewWrap">
-  <div id="preview">
-    <canvas id="bgCanvas"></canvas>
-    <div id="scrim"></div>
-    <div id="card-overlay">
-      <div class="topbar">
-        <span class="brand">
-          {"<img src='data:image/png;base64," + logo_b64 + "' alt='ACI' style='width:18px;height:18px;object-fit:contain;filter:brightness(0) invert(1);opacity:0.85'/>" if logo_b64 else ""}
-          ADPTVV
-        </span>
-      </div>
-      <div class="hero-dial">
-        <svg width="112" height="112" viewBox="0 0 52 52">
-          <circle cx="26" cy="26" r="21" fill="none" stroke="rgba(255,255,255,0.12)" stroke-width="5"/>
-          <circle cx="26" cy="26" r="21" fill="none" stroke="{c_r}" stroke-width="5" stroke-linecap="round" stroke-dasharray="{circ}" stroke-dashoffset="{ro_r}" transform="rotate(-90 26 26)"/>
-          <text x="26" y="30" text-anchor="middle" font-size="15" font-weight="700" fill="white" font-family="system-ui">{d_r}</text>
-        </svg>
-        <div class="hero-lbl">Readiness</div>
-        <div class="hero-verdict-txt" style="color:{c_verdict}">{verdict_txt}</div>
-      </div>
-      <div class="dials dials-3">
-        <div class="dial-item">
-          <svg width="46" height="46" viewBox="0 0 52 52">
-            <circle cx="26" cy="26" r="21" fill="none" stroke="rgba(255,255,255,0.12)" stroke-width="4"/>
-            <circle cx="26" cy="26" r="21" fill="none" stroke="{c_n}" stroke-width="4" stroke-linecap="round" stroke-dasharray="{circ}" stroke-dashoffset="{ro_n}" transform="rotate(-90 26 26)"/>
-            <text x="26" y="30" text-anchor="middle" font-size="13" font-weight="700" fill="white" font-family="system-ui">{d_n}</text>
-          </svg><div class="dial-lbl">Neuro</div>
-        </div>
-        <div class="dial-item">
-          <svg width="46" height="46" viewBox="0 0 52 52">
-            <circle cx="26" cy="26" r="21" fill="none" stroke="rgba(255,255,255,0.12)" stroke-width="4"/>
-            <circle cx="26" cy="26" r="21" fill="none" stroke="{c_e}" stroke-width="4" stroke-linecap="round" stroke-dasharray="{circ}" stroke-dashoffset="{ro_e}" transform="rotate(-90 26 26)"/>
-            <text x="26" y="30" text-anchor="middle" font-size="13" font-weight="700" fill="white" font-family="system-ui">{d_e}</text>
-          </svg><div class="dial-lbl">Exposure</div>
-        </div>
-        <div class="dial-item">
-          <svg width="46" height="46" viewBox="0 0 52 52">
-            <circle cx="26" cy="26" r="21" fill="none" stroke="rgba(255,255,255,0.12)" stroke-width="4"/>
-            <circle cx="26" cy="26" r="21" fill="none" stroke="{c_sp}" stroke-width="4" stroke-linecap="round" stroke-dasharray="{circ}" stroke-dashoffset="{ro_sp}" transform="rotate(-90 26 26)"/>
-            <text x="26" y="30" text-anchor="middle" font-size="13" font-weight="700" fill="white" font-family="system-ui">{d_sn}</text>
-          </svg><div class="dial-lbl">Streak</div>
-        </div>
-      </div>
-      <div class="divider"></div>
-      <div class="quote">&ldquo;{mot_quote}&rdquo;</div>
-      <div class="footer"><div class="footer-date">{date_str}</div></div>
-    </div>
-  </div>
-</div>
-<div id="controls">
-  <label id="photolabel" for="photoInput">
-    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-      <rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8.5" cy="8.5" r="1.5"/>
-      <polyline points="21 15 16 10 5 21"/>
-    </svg>Choose a background photo
-  </label>
-  <input type="file" id="photoInput" accept="image/*">
-  <button id="dlBtn">Download story (1080&times;1920)</button>
-  <button id="resetBtn">Reset position &amp; size</button>
-  <div id="hint">Pinch to resize &middot; Drag to reposition &middot; Tap Reset to restore</div>
-</div>
-<script>
-  const EXPORT_W=1080,EXPORT_H=1920;
-  const wrap=document.getElementById('previewWrap'),previewEl=document.getElementById('preview'),canvasEl=document.getElementById('bgCanvas');
-  let userImage=null,logoImg=null;
-  let userImageDataURL=null; // persist across redraws
-
-  // Logo injected as base64 from server — no CORS, always works
-  const LOGO_DATA_URL="{logo_b64 and ('data:image/png;base64,' + logo_b64) or ''}";
-  if(LOGO_DATA_URL){{
-    logoImg=new Image();
-    logoImg.src=LOGO_DATA_URL;
-  }}
-
-  function drawPreviewBg(){{
-    // Get actual rendered size — use getBoundingClientRect for accuracy on mobile
-    const rect=previewEl.getBoundingClientRect();
-    const w=rect.width||previewEl.clientWidth||320;
-    const h=rect.height||previewEl.clientHeight||Math.round(w*16/9);
-    if(w===0||h===0){{setTimeout(drawPreviewBg,100);return;}}
-    canvasEl.width=w;canvasEl.height=h;
-    const ctx=canvasEl.getContext('2d');
-    ctx.clearRect(0,0,w,h);
-    if(userImage){{
-      // Cover fit — always fill the canvas
-      const scale=Math.max(w/userImage.naturalWidth,h/userImage.naturalHeight);
-      const dw=userImage.naturalWidth*scale,dh=userImage.naturalHeight*scale;
-      ctx.drawImage(userImage,(w-dw)/2,(h-dh)/2,dw,dh);
-    }}else{{
-      const g=ctx.createLinearGradient(0,0,w,h);
-      g.addColorStop(0,'#0f2027');g.addColorStop(0.5,'#203a43');g.addColorStop(1,'#2c5364');
-      ctx.fillStyle=g;ctx.fillRect(0,0,w,h);
-    }}
-  }}
-
-  // Redraw on resize but don't lose the image
-  let resizeTimer;
-  window.addEventListener('resize',function(){{clearTimeout(resizeTimer);resizeTimer=setTimeout(drawPreviewBg,80);}});
-  // Initial draw — delayed to let modal/iframe fully render
-  setTimeout(drawPreviewBg,200);
-
-  // Transform state — allow scale 0.3 to 4
-  let currentScale=1,translateX=0,translateY=0;
-  let isDragging=false,dragStartX=0,dragStartY=0;
-  let startDist=0,startScale=1,startTX=0,startTY=0,pinchMidX=0,pinchMidY=0;
-
-  function applyTransform(){{
-    previewEl.style.transform=`translate(${{translateX}}px,${{translateY}}px) scale(${{currentScale}})`;
-    previewEl.style.transformOrigin='center center';
-  }}
-  function dist(a,b){{const dx=a.clientX-b.clientX,dy=a.clientY-b.clientY;return Math.sqrt(dx*dx+dy*dy);}}
-  function midpoint(a,b){{return{{x:(a.clientX+b.clientX)/2,y:(a.clientY+b.clientY)/2}};}}
-
-  previewEl.style.transition='none';previewEl.style.cursor='grab';previewEl.style.touchAction='none';
-
-  previewEl.addEventListener('touchstart',function(e){{
-    e.preventDefault();
-    if(e.touches.length===2){{
-      startDist=dist(e.touches[0],e.touches[1]);
-      startScale=currentScale;
-      startTX=translateX;startTY=translateY;
-      const mid=midpoint(e.touches[0],e.touches[1]);
-      const rect=previewEl.getBoundingClientRect();
-      pinchMidX=mid.x-rect.left-rect.width/2;
-      pinchMidY=mid.y-rect.top-rect.height/2;
-      isDragging=false;
-    }}else if(e.touches.length===1){{
-      isDragging=true;
-      dragStartX=e.touches[0].clientX-translateX;
-      dragStartY=e.touches[0].clientY-translateY;
-    }}
-  }},{{passive:false}});
-
-  previewEl.addEventListener('touchmove',function(e){{
-    e.preventDefault();
-    if(e.touches.length===2){{
-      const newDist=dist(e.touches[0],e.touches[1]);
-      const newScale=Math.min(4,Math.max(0.3,startScale*(newDist/startDist)));
-      const scaleDelta=newScale/startScale;
-      translateX=startTX+pinchMidX*(1-scaleDelta);
-      translateY=startTY+pinchMidY*(1-scaleDelta);
-      currentScale=newScale;
-      applyTransform();
-    }}else if(e.touches.length===1&&isDragging){{
-      translateX=e.touches[0].clientX-dragStartX;
-      translateY=e.touches[0].clientY-dragStartY;
-      applyTransform();
-    }}
-  }},{{passive:false}});
-
-  previewEl.addEventListener('touchend',function(e){{
-    isDragging=false;
-  }});
-
-  // Mouse wheel zoom (desktop)
-  wrap.addEventListener('wheel',function(e){{
-    e.preventDefault();
-    currentScale=Math.min(4,Math.max(0.3,currentScale*(e.deltaY>0?0.9:1.1)));
-    applyTransform();
-  }},{{passive:false}});
-
-  // Double-tap or reset button
-  let lastTap=0;
-  previewEl.addEventListener('touchend',function(e){{
-    const now=Date.now();
-    if(now-lastTap<300){{resetTransform();}}
-    lastTap=now;
-  }});
-  document.getElementById('resetBtn').addEventListener('click',resetTransform);
-  function resetTransform(){{
-    currentScale=1;translateX=0;translateY=0;
-    previewEl.style.transition='transform 0.25s ease-out';
-    applyTransform();
-    setTimeout(()=>previewEl.style.transition='none',260);
-  }}
-
-  // Photo picker — store dataURL so redraws never lose the image
-  document.getElementById('photoInput').addEventListener('change',function(e){{
-    const file=e.target.files[0];if(!file)return;
-    const reader=new FileReader();
-    reader.onload=function(ev){{
-      userImageDataURL=ev.target.result;
-      const img=new Image();
-      img.onload=function(){{
-        userImage=img;
-        drawPreviewBg();
-      }};
-      img.onerror=function(){{console.error('Image load failed');}};
-      img.src=userImageDataURL;
-    }};
-    reader.onerror=function(){{alert('Could not read file. Try a different photo.');}};
-    reader.readAsDataURL(file);
-    document.getElementById('photolabel').innerHTML='<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg> Change photo';
-  }});
-
-  const isIOS=/iPad|iPhone|iPod/.test(navigator.userAgent)&&!window.MSStream;
-  const isSafari=/^((?!chrome|android).)*safari/i.test(navigator.userAgent);
-  const isiOSSafari=isIOS||isSafari;
-  if(isiOSSafari){{
-    document.getElementById('hint').innerHTML='\u26a0\ufe0f iPhone: tap Download, then long-press the image \u2192 Save to Photos';
-    document.getElementById('hint').style.color='rgba(255,200,80,0.9)';
-  }}
-
-  document.getElementById('dlBtn').addEventListener('click',function(){{
-    const btn=this;btn.textContent='Generating\u2026';btn.disabled=true;
-
-    function doExport(){{
-    const out=document.createElement('canvas');out.width=EXPORT_W;out.height=EXPORT_H;
-    const ctx=out.getContext('2d');
-
-    // Background — use naturalWidth for reliability
-    if(userImage&&userImage.naturalWidth>0){{
-      const scale=Math.max(EXPORT_W/userImage.naturalWidth,EXPORT_H/userImage.naturalHeight);
-      const dw=userImage.naturalWidth*scale,dh=userImage.naturalHeight*scale;
-      ctx.drawImage(userImage,(EXPORT_W-dw)/2,(EXPORT_H-dh)/2,dw,dh);
-    }}else{{
-      const g=ctx.createLinearGradient(0,0,EXPORT_W,EXPORT_H);
-      g.addColorStop(0,'#0f2027');g.addColorStop(0.5,'#203a43');g.addColorStop(1,'#2c5364');
-      ctx.fillStyle=g;ctx.fillRect(0,0,EXPORT_W,EXPORT_H);
-    }}
-
-    // Scrim
-    const scrim=ctx.createLinearGradient(0,0,0,EXPORT_H);
-    scrim.addColorStop(0,'rgba(0,0,0,0.12)');scrim.addColorStop(0.30,'rgba(0,0,0,0.04)');
-    scrim.addColorStop(0.58,'rgba(0,0,0,0.55)');scrim.addColorStop(1.0,'rgba(0,0,0,0.82)');
-    ctx.fillStyle=scrim;ctx.fillRect(0,0,EXPORT_W,EXPORT_H);
-
-    const PAD=80,CX=EXPORT_W/2;
-
-    // ── Layout: hero readiness ring, three smaller ones beneath ─────────────
-    const HERO_R=150,HERO_SW=28,HERO_Y=EXPORT_H*0.44;
-    const RING_R=68,RING_SW=15,RING_Y=HERO_Y+HERO_R+150;
-    const SPACING=EXPORT_W/3;
-    const R2_X=SPACING*0+SPACING/2;
-    const R3_X=SPACING*1+SPACING/2;
-    const R4_X=SPACING*2+SPACING/2;
-
-    // ── Reusable ring draw helper ─────────────────────────────────────────────
-    function drawRing(cx,cy,r,sw,pct100,color,valTxt,label,valFont,lblFont){{
-      ctx.beginPath();ctx.arc(cx,cy,r,0,Math.PI*2);
-      ctx.strokeStyle='rgba(255,255,255,0.12)';ctx.lineWidth=sw;ctx.lineCap='butt';ctx.stroke();
-      if(pct100>0){{
-        const start=-Math.PI/2,end=start+(Math.min(pct100,100)/100)*Math.PI*2;
-        ctx.beginPath();ctx.arc(cx,cy,r,start,end);
-        ctx.strokeStyle=color;ctx.lineWidth=sw;ctx.lineCap='round';ctx.stroke();ctx.lineCap='butt';
-      }}
-      ctx.font='bold '+valFont+'px system-ui';ctx.fillStyle='#fff';
-      ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText(valTxt,cx,cy);
-      ctx.font=lblFont+'px system-ui';ctx.fillStyle='rgba(255,255,255,0.45)';
-      ctx.textAlign='center';ctx.textBaseline='alphabetic';ctx.fillText(label,cx,cy+r+44);
-    }}
-
-    // ── Brand — centred above rings ───────────────────────────────────────────
-    const LOGO_SIZE=48,BRAND_Y=HERO_Y-HERO_R-100;
-    if(logoImg&&logoImg.naturalWidth>0){{
-      const oc=document.createElement('canvas');oc.width=LOGO_SIZE;oc.height=LOGO_SIZE;
-      const octx=oc.getContext('2d');
-      octx.drawImage(logoImg,0,0,LOGO_SIZE,LOGO_SIZE);
-      octx.globalCompositeOperation='source-in';
-      octx.fillStyle='rgba(255,255,255,0.90)';octx.fillRect(0,0,LOGO_SIZE,LOGO_SIZE);
-      ctx.font='500 26px system-ui';
-      const tw=ctx.measureText('ADPTVV').width;
-      const bx=CX-(LOGO_SIZE+12+tw)/2;
-      ctx.drawImage(oc,bx,BRAND_Y,LOGO_SIZE,LOGO_SIZE);
-      ctx.fillStyle='rgba(255,255,255,0.70)';ctx.textAlign='left';ctx.textBaseline='middle';
-      ctx.fillText('ADPTVV',bx+LOGO_SIZE+12,BRAND_Y+LOGO_SIZE/2);
-    }}else{{
-      ctx.font='500 26px system-ui';ctx.fillStyle='rgba(255,255,255,0.70)';
-      ctx.textAlign='center';ctx.textBaseline='middle';
-      ctx.fillText('ADPTVV',CX,BRAND_Y+LOGO_SIZE/2);
-    }}
-
-    // ── Hero readiness, then the three supporting scores ─────────────────────
-    drawRing(CX,HERO_Y,HERO_R,HERO_SW,{d_r},'{c_r}','{d_r}','READINESS',108,26);
-    ctx.font='600 36px system-ui';ctx.fillStyle='{c_verdict}';
-    ctx.textAlign='center';ctx.textBaseline='alphabetic';
-    ctx.fillText('{verdict_txt}',CX,HERO_Y+HERO_R+96);
-
-    drawRing(R2_X,RING_Y,RING_R,RING_SW,{d_n},'{c_n}','{d_n}','NEURO',50,20);
-    drawRing(R3_X,RING_Y,RING_R,RING_SW,{d_e},'{c_e}','{d_e}','EXPOSURE',50,20);
-    drawRing(R4_X,RING_Y,RING_R,RING_SW,{d_sp},'{c_sp}','{d_sn}','STREAK',50,20);
-
-    // ── Divider ───────────────────────────────────────────────────────────────
-    const divY=RING_Y+RING_R+90;
-    ctx.beginPath();ctx.moveTo(PAD,divY);ctx.lineTo(EXPORT_W-PAD,divY);
-    ctx.strokeStyle='rgba(255,255,255,0.18)';ctx.lineWidth=2;ctx.stroke();
-
-    // Quote
-    const quoteText='\u201c{mot_quote}\u201d',quoteY=divY+72,maxWidth=EXPORT_W-PAD*2;
-    ctx.font='italic 44px system-ui,sans-serif';ctx.fillStyle='rgba(255,255,255,0.90)';
-    ctx.textAlign='center';ctx.textBaseline='alphabetic';
-    wrapText(ctx,quoteText,EXPORT_W/2,quoteY,maxWidth,64);
-
-    // Footer
-    const footY=EXPORT_H-80;
-    ctx.font='26px system-ui';ctx.fillStyle='rgba(255,255,255,0.30)';
-    ctx.textAlign='left';ctx.textBaseline='alphabetic';
-    ctx.fillText('{date_str}',PAD,footY);
-
-    const imgData=out.toDataURL('image/png');
-    if(isiOSSafari){{
-      const newTab=window.open();
-      if(newTab){{
-        newTab.document.write('<html><head><title>ACI Share Card</title><meta name="viewport" content="width=device-width"></head><body style="margin:0;background:#111;display:flex;flex-direction:column;align-items:center;padding:16px;"><p style="color:#fff;font-size:14px;margin-bottom:12px;">Long-press the image \u2192 Save to Photos</p><img src="'+imgData+'" style="max-width:100%;border-radius:12px;"/></body></html>');
-        newTab.document.close();
-      }}
-      btn.textContent='\u2705 Opened \u2014 save from new tab';btn.style.background='#2E7D32';
-    }}else{{
-      const a=document.createElement('a');a.download='aci-{dl_name}.png';a.href=imgData;a.click();
-      btn.textContent='Download story (1080\u00d71920)';
-    }}
-    btn.disabled=false;
-    }} // end doExport
-
-    // Restore image from dataURL if needed, then export
-    if((!userImage||userImage.naturalWidth===0) && userImageDataURL){{
-      const restored=new Image();
-      restored.onload=function(){{userImage=restored;doExport();}};
-      restored.src=userImageDataURL;
-    }}else{{
-      doExport();
-    }}
-  }});
-
-  function wrapText(ctx,text,x,y,maxWidth,lineHeight){{
-    const words=text.split(' ');let line='',cy=y;
-    for(let i=0;i<words.length;i++){{
-      const test=line+words[i]+' ';
-      if(ctx.measureText(test).width>maxWidth&&i>0){{ctx.fillText(line.trim(),x,cy);line=words[i]+' ';cy+=lineHeight;}}
-      else{{line=test;}}
-    }}
-    ctx.fillText(line.trim(),x,cy);
-  }}
-</script>
-</body></html>"""
-
+    try:
+        _pbs = current_pbs(athlete_id)
+    except Exception:
+        _pbs = {}
+    stickers = {}
+    for _key, _fn in (("track", lambda: share_track_data(df, athlete_id, today, _pbs)),
+                      ("gym", lambda: share_gym_data(df, athlete_id, today, _pbs)),
+                      ("well", lambda: share_wellness_data(df, today))):
+        try:
+            stickers[_key] = _fn()
+        except Exception as e:
+            print(f"Share sticker {_key} error:", e)
+            stickers[_key] = None
+    try:
+        week_card = share_week_data(df, today, streak, weekly_pct)
+    except Exception as e:
+        print("Share card week error:", e)
+        week_card = {"range": "", "stats": [], "days": [], "line": ""}
+    data = {
+        "first": first_name, "today": today.strftime("%A %d %b").replace(" 0", " "), "file": dl_name,
+        **stickers, "week": week_card,
+        "quote": {"text": mot_quote, "by": f"{first_name} · {d_sn}-day streak" if d_sn else first_name},
+        "ready": {"r": d_r, "rc": c_r, "n": d_n, "e": d_e, "sp": d_sp, "s": d_sn,
+                  "verdict": verdict_txt, "vc": c_verdict, "quote": mot_quote},
+    }
     return VISIBLE, html.Iframe(
-        srcDoc=html_src,
-        style={"width": "100%", "height": "680px", "border": "none", "background": "#111", "display": "block"}
+        srcDoc=build_share_card_html(data, logo_b64), allow="web-share; clipboard-write",
+        style={"width": "100%", "height": "min(760px, calc(88vh - 52px))", "border": "none", "background": "#111",
+               "display": "block"}
     )
 
 
@@ -8977,7 +9358,7 @@ def write_cells(tab_name: str, row_idx_0: int, payload: dict):
     """Write only the given columns of one row (leaves formulas elsewhere alone)."""
     if sh is None:
         return
-    ws = sh.worksheet(tab_name)
+    ws = get_ws(tab_name)
     headers = ws.row_values(1)
     row_number = row_idx_0 + 2
     updates = []
@@ -9354,6 +9735,9 @@ def garmin_connect():
     if not GARMIN_ENABLED:
         return "Garmin integration not configured (missing API keys).", 503
     athlete_id = flask_request.args.get("athlete", "unknown")
+    _u = current_user()
+    if not _u or (not _u["is_coach"] and _u["sheet"] != athlete_id):
+        return "Log in to ADPTVV first, then connect Garmin from your Home screen.", 403
     try:
         token, secret = garmin_get_request_token()
         _garmin_temp_secrets[athlete_id] = (token, secret)
@@ -9423,6 +9807,8 @@ def garmin_push():
 
 @server.route("/garmin/status")
 def garmin_status():
+    if (_deny := coach_only()):
+        return _deny
     if sh is None:
         return jsonify({"error": "Google Sheets not connected"}), 503
     linked = []
@@ -9805,6 +10191,34 @@ def update_squad_view(nav_clicks, refresh_clicks, auth_data, theme):
             status_bg = "#ffebee";
             status_color = "#C62828"
 
+        # Things the coach should look at today, shown as chips on the card.
+        flags = []
+        if not df.empty:
+            try:
+                dfa = df.copy()
+                dfa["_d"] = pd.to_datetime(dfa["Date"], errors="coerce").dt.date
+                dfa = dfa[dfa["_d"] <= today].sort_values("_d")
+                for acol in ("EMWA ACWR", "EWMA ACWR", "RA ACWR"):
+                    if acol in dfa.columns:
+                        av = pd.to_numeric(dfa[acol], errors="coerce").dropna()
+                        if not av.empty and float(av.iloc[-1]) > 1.5:
+                            flags.append(("graph-up-arrow", f"Load spike · ACWR {float(av.iloc[-1]):.2f}", "#E53935"))
+                        break
+                hi = [f for f in get_wellness_flags_structured(df, days=7) if f.get("severity") == "high"]
+                if hi:
+                    flags.append(("activity", hi[0]["text"], "#F9A825"))
+            except Exception as ex:
+                print(f"Squad flags error for {sheet_name}: {ex}")
+            try:
+                eye = eye_today(sheet_name, today)
+                if eye and eye.get("tone") in ("bad", "watch"):
+                    flags.append(("eye", f"Eye Check · {eye['verdict'].lower()}",
+                                  "#E53935" if eye["tone"] == "bad" else "#F9A825"))
+            except Exception:
+                pass
+        if readiness_val is not None and readiness_val < 40 and not stale_flag_off(days_ago):
+            flags.append(("battery-low", f"Readiness {int(round(readiness_val))}", "#E53935"))
+
         stale_athlete = days_ago is None or days_ago >= STALE_DAYS
         r_col = score_colour(readiness_val)
         n_col = score_colour(neuro_val)
@@ -9847,6 +10261,12 @@ def update_squad_view(nav_clicks, refresh_clicks, auth_data, theme):
                       "marginBottom": "10px" if (session_note or session_rpe) else "0"}),
 
             html.Div([
+                html.Span([html.I(className=f"bi bi-{ic}"), txt], className="squad-flag",
+                          style={"color": col, "borderColor": col + "88", "background": col + "1a"})
+                for ic, txt, col in flags
+            ], className="squad-flags") if flags else None,
+
+            html.Div([
                 html.Div([
                     html.Span("Today: ", style={"fontSize": "11px", "color": _muted_col, "fontWeight": "600"}),
                     html.Span(f"RPE {session_rpe}/5  ", style={"fontSize": "12px", "color": "var(--text)"})
@@ -9870,10 +10290,16 @@ def update_squad_view(nav_clicks, refresh_clicks, auth_data, theme):
                 "cursor": "pointer",
             })
 
-        cards.append(card)
+        cards.append((-len(flags), sheet_name, card, days_ago == 0))
 
     if not cards:
         return html.Div("No athletes found.", className="text-muted mt-3")
+
+    # Athletes with the most flags first, then A–Z.
+    cards.sort(key=lambda c: (c[0], c[1]))
+    logged_today = sum(1 for c in cards if c[3])
+    flagged = sum(1 for c in cards if c[0] < 0)
+    cards = [c[2] for c in cards]
 
     total = len(all_sheets)
     summary = html.Div([
@@ -9882,12 +10308,29 @@ def update_squad_view(nav_clicks, refresh_clicks, auth_data, theme):
             html.Div("Athletes", style={"fontSize": "11px", "color": _muted_col}),
         ], style={"textAlign": "center", "flex": "1"}),
         html.Div([
+            html.Div(f"{logged_today}/{total}", style={"fontSize": "28px", "fontWeight": "800", "color": "#2fb344"}),
+            html.Div("Logged today", style={"fontSize": "11px", "color": _muted_col}),
+        ], style={"textAlign": "center", "flex": "1"}),
+        html.Div([
+            html.Div(str(flagged), style={"fontSize": "28px", "fontWeight": "800",
+                                          "color": "#E53935" if flagged else _muted_col}),
+            html.Div("To check", style={"fontSize": "11px", "color": _muted_col}),
+        ], style={"textAlign": "center", "flex": "1"}),
+        html.Div([
             html.Div(today.strftime("%a"), style={"fontSize": "22px", "fontWeight": "700", "color": _summary_day}),
             html.Div(today.strftime("%d %b %Y"), style={"fontSize": "11px", "color": _muted_col}),
         ], style={"textAlign": "center", "flex": "1"}),
     ], style={"display": "flex", "background": _summary_bg, "borderRadius": "12px",
               "padding": "12px", "marginBottom": "16px", "border": "1px solid var(--border)"})
 
+    # Research export link (coach only) is switched off for now. To show it again, set
+    # RESEARCH_EXPORT=1 on Render and add a "Consent" tab (see research_export below).
+    if os.getenv("RESEARCH_EXPORT") == "1":
+        export_link = html.Div([
+            html.A([html.I(className="bi bi-download me-1"), "Research export (consented athletes, de-identified)"],
+                   href="/export/research.zip", target="_blank", className="squad-export"),
+        ], style={"textAlign": "right", "margin": "-6px 0 14px"})
+        return [summary, export_link] + cards
     return [summary] + cards
 
 @app.callback(
@@ -9914,8 +10357,104 @@ def squad_card_click(n_clicks_list):
 
 
 
+# ============================================================
+#  Research export (coach only): /export/research.zip
+#  Only athletes marked "Yes" in the Consent tab are included. Names are
+#  replaced by codes (the same code every time, so exports line up), and free
+#  text, emails and Garmin keys are left out.
+# ============================================================
+
+CONSENT_TAB = "Consent"
+CONSENT_HEADERS = ["Athlete", "Research_Consent", "Consent_Date", "Notes"]
+RESEARCH_TRAINING_COLS = [
+    "Date", "Day", "Workout", "Focus", "Venue", "Key_Distance", "Duration", "sRPE", "Load",
+    "RPE_Post_Session", "Session_1_5", "Sleep_1_5", "Fatigue_1_5", "Mood_1_5", "Soreness_1_5",
+    "SPEED (m)", "TEMPO (m)", "RA7 Avg Daily Load", "EWMA 28", "EMWA 7", "EMWA ACWR", "RA ACWR",
+    "MONOTONY", "STRAIN", "AI_Lens_1", "AI_Lens_2", "AI_Lens_Source",
+]
+RESEARCH_EYE_COLS = ["Date", "Logged_At", "Blink_Rate", "Blink_Dur_ms", "PERCLOS", "Pupil_Constrict",
+                     "PVT3_Median_ms", "PVT3_Lapses", "PVT3_Trials", "PVT_False_Starts", "Quality",
+                     "Cond_Sleep", "Cond_Caffeine", "Cond_Trained"]
+
+
+def research_code(name: str) -> str:
+    return "ATH-" + hmac.new(str(server.secret_key).encode(), name.strip().lower().encode(),
+                             hashlib.sha256).hexdigest()[:6].upper()
+
+
+def consented_athletes() -> list:
+    try:
+        ws = get_ws(CONSENT_TAB)
+    except Exception:
+        return []
+    vals = ws.get_all_values()
+    if not vals:
+        return []
+    head = [h.strip() for h in vals[0]]
+    if "Athlete" not in head or "Research_Consent" not in head:
+        return []
+    a, c = head.index("Athlete"), head.index("Research_Consent")
+    return sorted({r[a].strip() for r in vals[1:]
+                   if len(r) > max(a, c) and r[a].strip() and r[c].strip().lower() in ("yes", "y", "true", "1")})
+
+
+@server.route("/export/research.zip")
+def research_export():
+    if os.getenv("RESEARCH_EXPORT") != "1":
+        return jsonify({"error": "Research export is switched off."}), 404
+    if (_deny := coach_only()):
+        return _deny
+    import io, zipfile
+    names = consented_athletes()
+    if not names:
+        return ("<html><body style='font-family:system-ui;background:#0d1117;color:#e6ebf1;padding:40px'>"
+                "<h3>No consented athletes yet</h3><p>Add a tab called <b>Consent</b> with the headings "
+                "<code>Athlete | Research_Consent | Consent_Date | Notes</code>, one row per athlete "
+                "(Athlete = their tab name, Research_Consent = Yes). Then try again.</p></body></html>"), 200
+    train_parts, eye_parts = [], []
+    for name in names:
+        code = research_code(name)
+        df = load_tab_cached(name)
+        if df is not None and not df.empty:
+            d = df.copy()
+            for n in (1, 2):
+                col = f"AI_Suggestion_{n}"
+                if col in d.columns:
+                    d[f"AI_Lens_{n}"] = d[col].astype(str).map(lambda t: split_lens(t)[0] if t else "")
+            d = d[[c for c in RESEARCH_TRAINING_COLS if c in d.columns]].copy()
+            if "Date" in d.columns:     # logged days up to today only, not future plans
+                _dd = pd.to_datetime(d["Date"], errors="coerce").dt.date
+                d = d[_dd.notna() & (_dd <= today_adl())]
+            d.insert(0, "Athlete_Code", code)
+            train_parts.append(d)
+        e = load_eye_rows(name)
+        if e is not None and not e.empty:
+            e = e[[c for c in RESEARCH_EYE_COLS if c in e.columns]].copy()
+            e.insert(0, "Athlete_Code", code)
+            eye_parts.append(e)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("training.csv", (pd.concat(train_parts) if train_parts else pd.DataFrame()).to_csv(index=False))
+        z.writestr("eyechecks.csv", (pd.concat(eye_parts) if eye_parts else pd.DataFrame()).to_csv(index=False))
+        z.writestr("README.txt", (
+            f"ADPTVV research export · {dt.datetime.now(ADL_TZ).strftime('%Y-%m-%d %H:%M')} Adelaide time\n"
+            f"Athletes included: {len(names)} (only those with Research_Consent = Yes in the Consent tab)\n\n"
+            "Athlete_Code replaces names and stays the same between exports. Keep the code-to-name key\n"
+            "separately and securely (or don't keep one at all), as your ethics approval requires.\n"
+            "Left out: athlete notes and other free text, AI feedback text, emails, Garmin keys.\n"
+            "Wellness scales: 1-5, 5 = best (Soreness: 5 = most sore). RPE_Post_Session: 1-5.\n"
+            "AI_Lens_1/2: feedback lens used; AI_Lens_Source: athlete chose it or kept the app's selection.\n"
+            "Eye Check measures are unvalidated phone estimates.\n"))
+    buf.seek(0)
+    from flask import send_file
+    return send_file(buf, mimetype="application/zip", as_attachment=True,
+                     download_name=f"adptvv_research_{today_adl().isoformat()}.zip")
+
+
 @server.route("/debug/dates/<tab_name>")
 def debug_dates(tab_name):
+    if (_deny := coach_only()):
+        return _deny
     if sh is None:
         return jsonify({"error": "no sheet"})
     try:
@@ -9946,6 +10485,8 @@ def debug_dates(tab_name):
 
 @server.route("/debug/dashboard/<tab_name>")
 def debug_dashboard(tab_name):
+    if (_deny := coach_only()):
+        return _deny
     try:
         df = load_tab(tab_name)
         if df is None or df.empty:
@@ -10145,7 +10686,9 @@ EYE_HEADERS = ["Athlete", "Date", "Logged_At", "Blink_Rate", "Blink_Dur_ms", "PE
                "Pupil_Constrict", "PVT_Median_ms", "PVT_Lapses", "PVT_False_Starts", "Quality",
                # 3-minute reaction test (Basner 2011 PVT-B, lapses counted from 355 ms).
                # Kept separate from the old 30 s columns so the two never mix in a baseline.
-               "PVT3_Median_ms", "PVT3_Lapses", "PVT3_Trials"]
+               "PVT3_Median_ms", "PVT3_Lapses", "PVT3_Trials",
+               # Conditions the athlete tapped before the check (sleep / caffeine / trained already).
+               "Cond_Sleep", "Cond_Caffeine", "Cond_Trained"]
 EYE_MIN_BASELINE = 5
 EYE_BASELINE_N = 14
 
@@ -10413,7 +10956,10 @@ def eyecheck_save():
                 **{c: ("" if row[c] is None else row[c]) for _k, c, *_ in EYE_METRICS},
                 "PVT_False_Starts": "" if fs is None else int(fs),
                 "PVT3_Trials": "" if trials is None else int(trials),
-                "Quality": str(data.get("quality", ""))[:120]}
+                "Quality": str(data.get("quality", ""))[:120],
+                "Cond_Sleep": {"well": "Well", "ok": "OK", "poor": "Poorly"}.get(str(data.get("cond_sleep", "")), ""),
+                "Cond_Caffeine": {"yes": "Yes", "no": "No"}.get(str(data.get("cond_caffeine", "")), ""),
+                "Cond_Trained": {"yes": "Yes", "no": "No"}.get(str(data.get("cond_trained", "")), "")}
         head = ws.row_values(1) or EYE_HEADERS
         ws.append_row([vals.get(h, "") for h in head], value_input_option="USER_ENTERED")
         _eye_cache.pop("__all__", None)
@@ -10558,6 +11104,12 @@ video{width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}
 .refs li i{color:var(--text);font-style:italic}
 .refs .disc{font-size:12px;line-height:1.45;color:var(--muted)}
 .hide{display:none!important}
+.cq{display:flex;flex-direction:column;gap:6px}
+.cq .lab{font-size:14.5px;color:var(--text);font-weight:600}
+.seg{display:flex;gap:6px}
+.seg button{flex:1;min-height:42px;border-radius:12px;border:1px solid var(--border);background:transparent;
+  color:var(--text);font-size:15px;font-weight:600;cursor:pointer}
+.seg button.on{background:var(--accent);border-color:var(--accent);color:#07121f}
 </style></head>
 <body><div class="wrap">
 
@@ -10579,6 +11131,15 @@ video{width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}
     with your face in the oval — do it the same way each day.
     Put the phone on silent so nothing interrupts the reaction test.
     The video never leaves your phone — only the results are saved.</div>
+  <div class="card" id="conds" style="gap:12px">
+    <div class="step">Quick check first · helps compare days fairly</div>
+    <div class="cq"><div class="lab">How did you sleep?</div>
+      <div class="seg" data-k="sleep"><button data-v="well">Well</button><button data-v="ok">OK</button><button data-v="poor">Poorly</button></div></div>
+    <div class="cq"><div class="lab">Caffeine in the last 3 hours?</div>
+      <div class="seg" data-k="caffeine"><button data-v="no">No</button><button data-v="yes">Yes</button></div></div>
+    <div class="cq"><div class="lab">Trained already today?</div>
+      <div class="seg" data-k="trained"><button data-v="no">No</button><button data-v="yes">Yes</button></div></div>
+  </div>
   <button class="btn" id="startBtn">Start</button>
 </section>
 
@@ -10970,7 +11531,9 @@ async function save(){
   let res;
   try {
     const r = await fetch("/eyecheck/save", { method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({ athlete: ATHLETE, token: TOKEN, quality: quality.join("; "), ...out }) });
+      body: JSON.stringify({ athlete: ATHLETE, token: TOKEN, quality: quality.join("; "), ...out,
+                             cond_sleep: COND.sleep || "", cond_caffeine: COND.caffeine || "",
+                             cond_trained: COND.trained || "" }) });
     res = await r.json();
     if(!r.ok || !res.ok){ fail(res.error || "Couldn't save your results."); return; }
   } catch(e){ fail("Couldn't reach ADPTVV to save — check your connection and try again."); return; }
@@ -11011,6 +11574,15 @@ async function runAll(){
 }
 
 $("startBtn").onclick = runAll;
+// Conditions: optional taps before starting (tap again to clear).
+const COND = {};
+document.querySelectorAll(".seg").forEach(seg => {
+  seg.querySelectorAll("button").forEach(b => b.onclick = () => {
+    const k = seg.dataset.k, v = b.dataset.v, same = COND[k] === v;
+    seg.querySelectorAll("button").forEach(x => x.classList.remove("on"));
+    if(same){ delete COND[k]; } else { COND[k] = v; b.classList.add("on"); }
+  });
+});
 $("retryBtn").onclick = runAll;
 $("pvtOnlyBtn").onclick = async () => {
   for(const k in out) delete out[k]; quality.length = 0; quality.push("reaction test only");
