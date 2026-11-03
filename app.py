@@ -2771,13 +2771,13 @@ def compute_neuro_for_athlete(df: pd.DataFrame, today: dt.date, athlete: str | N
         return None
     neuro_val = float(np.clip(neuro_val, 0, 100))
     if athlete:
-        # Today's Eye Check (once the athlete has a baseline) nudges the score:
+        # Today's NeuroCheck (once the athlete has a baseline) nudges the score:
         # at most 10 points down, 5 up. See eye_neuro_adjustment().
         try:
             adj, _res = eye_neuro_adjustment(athlete, today)
             neuro_val = float(np.clip(neuro_val + adj, 0, 100))
         except Exception as e:
-            print(f"⚠️ Eye Check neuro blend failed for {athlete}: {e}")
+            print(f"⚠️ NeuroCheck neuro blend failed for {athlete}: {e}")
     return neuro_val
 
 
@@ -3989,7 +3989,7 @@ def compute_drivers(df: pd.DataFrame, today: dt.date, lookback: int = 28, athlet
             if row:
                 out.append(row)
         except Exception as e:
-            print(f"⚠️ Eye Check driver failed for {athlete}: {e}")
+            print(f"⚠️ NeuroCheck driver failed for {athlete}: {e}")
     return out
 
 
@@ -10212,7 +10212,7 @@ def update_squad_view(nav_clicks, refresh_clicks, auth_data, theme):
             try:
                 eye = eye_today(sheet_name, today)
                 if eye and eye.get("tone") in ("bad", "watch"):
-                    flags.append(("eye", f"Eye Check · {eye['verdict'].lower()}",
+                    flags.append(("eye", f"NeuroCheck · {eye['verdict'].lower()}",
                                   "#E53935" if eye["tone"] == "bad" else "#F9A825"))
             except Exception:
                 pass
@@ -10444,7 +10444,7 @@ def research_export():
             "Left out: athlete notes and other free text, AI feedback text, emails, Garmin keys.\n"
             "Wellness scales: 1-5, 5 = best (Soreness: 5 = most sore). RPE_Post_Session: 1-5.\n"
             "AI_Lens_1/2: feedback lens used; AI_Lens_Source: athlete chose it or kept the app's selection.\n"
-            "Eye Check measures are unvalidated phone estimates.\n"))
+            "NeuroCheck measures are unvalidated phone estimates.\n"))
     buf.seek(0)
     from flask import send_file
     return send_file(buf, mimetype="application/zip", as_attachment=True,
@@ -10672,7 +10672,7 @@ app.clientside_callback(
 
 
 # ============================================================
-#  EYE CHECK — optical fatigue test on the iPhone's front camera
+#  NEUROCHECK — optical fatigue test on the iPhone's front camera
 #  1) Blinks (30 s): blink rate, blink duration, PERCLOS
 #  2) Pupil response (~14 s): screen flashes white, pupil constriction %
 #  3) Reaction test (30 s): brief PVT — median reaction time + lapses
@@ -10722,7 +10722,7 @@ def eyecheck_token_ok(athlete: str, token: str) -> bool:
 
 def _eye_athletes() -> set:
     """
-    Athletes who get the Eye Check. By default every athlete does. To offer it to
+    Athletes who get the NeuroCheck. By default every athlete does. To offer it to
     only some, set EYECHECK_ATHLETES on Render to their sheet names, comma-separated,
     e.g.  Harrison Hunt, Cailen Hejka   (set it to  none  to switch it off for everyone).
     """
@@ -10757,7 +10757,7 @@ def _eye_ws(create: bool = False):
                     ws.add_cols(len(EYE_HEADERS) - ws.col_count)
                 ws.update(values=[EYE_HEADERS], range_name="A1")
         except Exception as e:
-            print(f"⚠️ Eye Check header check: {e}")
+            print(f"⚠️ NeuroCheck header check: {e}")
     return ws
 
 
@@ -10777,13 +10777,13 @@ def _load_eye_tab() -> pd.DataFrame:
                 rows = [(r + [""] * len(head))[:len(head)] for r in vals[1:]]
                 all_df = pd.DataFrame(rows, columns=head)
     except Exception as e:
-        print(f"⚠️ Eye Check load failed: {e}")
+        print(f"⚠️ NeuroCheck load failed: {e}")
     _eye_cache["__all__"] = (now, all_df)
     return all_df
 
 
 def load_eye_rows(athlete: str) -> pd.DataFrame:
-    """All Eye Check rows for one athlete, oldest first."""
+    """All NeuroCheck rows for one athlete, oldest first."""
     all_df = _load_eye_tab()
     if all_df.empty or "Athlete" not in all_df.columns:
         return pd.DataFrame(columns=EYE_HEADERS)
@@ -10863,7 +10863,7 @@ def _eye_split_today(rows: pd.DataFrame, today: dt.date):
     return latest, before
 
 
-# How far today's Eye Check can move the Neuromuscular dial. Kept small on purpose:
+# How far today's NeuroCheck can move the Neuromuscular dial. Kept small on purpose:
 # most of the evidence for these tests comes from sleep deprivation, not training fatigue.
 EYE_NEURO_PER_INDEX = 6.0     # points per unit of the fatigue index (mean z vs own baseline)
 EYE_NEURO_MAX_DOWN = 10.0
@@ -10871,9 +10871,9 @@ EYE_NEURO_MAX_UP = 5.0
 
 
 def eye_today(athlete: str, today: dt.date):
-    """Today's assessed Eye Check for an athlete, or None."""
+    """Today's assessed NeuroCheck for an athlete, or None."""
     if athlete not in _eye_athletes():
-        return None              # Eye Check switched off for this athlete: no effect on the dials
+        return None              # NeuroCheck switched off for this athlete: no effect on the dials
     latest, before = _eye_split_today(load_eye_rows(athlete), today)
     return eyecheck_assess(latest, before) if latest is not None else None
 
@@ -10901,7 +10901,7 @@ def eye_driver_row(athlete: str, today: dt.date):
         status, tone = "Normal", "normal"
     off = [f"{ln['label'].lower()} {ln['value']}" for ln in res["lines"] if ln["flag"] == "worse"][:2]
     detail = f"Today's check · {adj:+.0f} on Neuromuscular" + (f" · {', '.join(off)}" if off else "")
-    return {"label": "Eye check", "detail": detail,
+    return {"label": "NeuroCheck", "detail": detail,
             "pct": float(np.clip(50 - idx * 20, 0, 100)), "usual_pct": 50.0,
             "status": status, "tone": tone, "kind": "scale", "delta": abs(idx) * 0.7}
 
@@ -10912,7 +10912,7 @@ def eyecheck_page():
     token = flask_request.args.get("t", "")
     if athlete not in _eye_athletes() or not eyecheck_token_ok(athlete, token):
         return ("<html><body style='font-family:system-ui;background:#0d1117;color:#e6ebf1;padding:40px'>"
-                "<h3>This Eye Check link has expired</h3><p>Open Eye Check again from the ADPTVV Home screen.</p>"
+                "<h3>This NeuroCheck link has expired</h3><p>Open NeuroCheck again from the ADPTVV Home screen.</p>"
                 "<p><a href='/' style='color:#4dabf7'>Back to ADPTVV</a></p></body></html>"), 403
     first = athlete.strip().split()[0] if athlete.strip() else "Athlete"
     page = (EYECHECK_HTML.replace("__ATHLETE__", json.dumps(athlete))
@@ -10931,7 +10931,7 @@ def eyecheck_save():
     data = flask_request.get_json(silent=True) or {}
     athlete = str(data.get("athlete", ""))
     if athlete not in _eye_athletes() or not eyecheck_token_ok(athlete, data.get("token", "")):
-        return jsonify({"ok": False, "error": "This link has expired — reopen Eye Check from Home."}), 403
+        return jsonify({"ok": False, "error": "This link has expired — reopen NeuroCheck from Home."}), 403
 
     row = {}
     for key, col, _l, _u, _w, _f, (lo, hi) in EYE_METRICS:
@@ -10964,7 +10964,7 @@ def eyecheck_save():
         ws.append_row([vals.get(h, "") for h in head], value_input_option="USER_ENTERED")
         _eye_cache.pop("__all__", None)
     except Exception as e:
-        print(f"❌ Eye Check save failed for {athlete}: {e}")
+        print(f"❌ NeuroCheck save failed for {athlete}: {e}")
         return jsonify({"ok": False, "error": "Couldn't save — check your connection and try again.",
                         **result}), 500
     return jsonify({"ok": True, **result})
@@ -11001,16 +11001,16 @@ def render_eyecheck_card(athlete_id, _today, auth_data):
             when = (f"Last check {last.strftime('%d %b').lstrip('0')}" if last is not None and pd.notna(last)
                     else "No checks yet")
             return html.Div([
-                html.Div("EYE CHECK", className="ts-label"),
+                html.Div("NEUROCHECK", className="ts-label"),
                 html.Div("Not done today", className="ts-title"),
                 html.Div(f"{when} · the athlete starts it from their own Home screen", className="ts-meta"),
             ], className="ts-card")
         return html.Div([
-            html.Div("EYE CHECK", className="ts-label"),
+            html.Div("NEUROCHECK", className="ts-label"),
             html.Div("How fresh are you really?", className="ts-title"),
             html.Div("About 4 minutes · blinks, pupil response and a 3-minute reaction test, "
                      "checked against your own normal", className="ts-meta"),
-            html.A("Start Eye Check", href=url, className="ts-log-btn", style=link_style),
+            html.A("Start NeuroCheck", href=url, className="ts-log-btn", style=link_style),
         ], className="ts-card")
 
     res = eyecheck_assess(latest, before)
@@ -11020,7 +11020,7 @@ def render_eyecheck_card(athlete_id, _today, auth_data):
         mark = {"worse": " ↓", "better": " ↑"}.get(ln["flag"], "")
         bits.append(f"{ln['label']} {ln['value']}{mark}")
     children = [
-        html.Div("EYE CHECK · TODAY", className="ts-label"),
+        html.Div("NEUROCHECK · TODAY", className="ts-label"),
         html.Div([
             html.Div(res["verdict"], className="ts-advice-head", style={"color": col}),
             html.Div(res["sub"], className="ts-advice-sub"),
@@ -11030,7 +11030,7 @@ def render_eyecheck_card(athlete_id, _today, auth_data):
         html.Div(" · ".join(bits), className="ts-meta", style={"marginTop": "8px"}),
     ]
     if not is_coach:
-        children.append(html.A("Redo Eye Check", href=url, className="ts-meta",
+        children.append(html.A("Redo NeuroCheck", href=url, className="ts-meta",
                                style={"display": "inline-block", "marginTop": "8px", "minHeight": "36px",
                                       "lineHeight": "36px", "color": "var(--accent)", "fontWeight": "600"}))
     return html.Div(children, className="ts-card")
@@ -11042,30 +11042,33 @@ EYECHECK_HTML = r"""<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#0d1117">
-<title>Eye Check · ADPTVV</title>
+<title>NeuroCheck · ADPTVV</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:ital,wght@0,400;0,500;0,600;0,700;0,800;1,400&display=swap" rel="stylesheet">
 <style>
 :root{--bg:#0d1117;--card:#161b22;--text:#e6ebf1;--muted:#9ca3af;--accent:#4dabf7;
       --good:#2fb344;--watch:#f5b301;--bad:#f44336;--border:rgba(255,255,255,.12)}
 *{box-sizing:border-box;margin:0;padding:0}
+button,input{font-family:inherit}
 html,body{min-height:100%;background:var(--bg);color:var(--text);
-  font-family:-apple-system,BlinkMacSystemFont,system-ui,sans-serif;
+  font-family:'Barlow Condensed',-apple-system,BlinkMacSystemFont,system-ui,sans-serif;font-size:17px;
   -webkit-tap-highlight-color:transparent;touch-action:manipulation}
 body{display:flex;justify-content:center;
   padding:max(16px,env(safe-area-inset-top)) 16px max(20px,env(safe-area-inset-bottom))}
 .wrap{width:100%;max-width:420px;display:flex;flex-direction:column;gap:14px}
 .top{display:flex;justify-content:space-between;align-items:center;min-height:44px}
-.top a{color:var(--accent);text-decoration:none;font-weight:600;font-size:15px;padding:10px 0}
-.step{font-size:13px;color:var(--muted)}
-h1{font-size:28px;font-weight:700;letter-spacing:-.01em}
-h2{font-size:20px;font-weight:700}
-p{font-size:15px;line-height:1.5;color:var(--muted)}
+.top a{color:var(--accent);text-decoration:none;font-weight:600;font-size:18px;padding:10px 0}
+.step{font-size:15px;letter-spacing:.02em;color:var(--muted)}
+h1{font-size:34px;font-weight:800;letter-spacing:.01em}
+h2{font-size:24px;font-weight:700}
+p{font-size:17px;line-height:1.45;color:var(--muted)}
 .card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:16px;
   display:flex;flex-direction:column;gap:10px}
-ol{padding-left:20px;color:var(--text);font-size:15px;line-height:1.55}
+ol{padding-left:20px;color:var(--text);font-size:17px;line-height:1.5}
 ol li span{color:var(--muted)}
-.tips{font-size:14px;color:var(--muted);line-height:1.55}
+.tips{font-size:16px;color:var(--muted);line-height:1.5}
 .btn{min-height:52px;border:none;border-radius:14px;background:var(--accent);color:#07121f;
-  font-size:17px;font-weight:700;width:100%;cursor:pointer;text-align:center;text-decoration:none;
+  font-size:20px;font-weight:700;letter-spacing:.02em;width:100%;cursor:pointer;text-align:center;text-decoration:none;
   display:flex;align-items:center;justify-content:center}
 .btn.ghost{background:transparent;border:1px solid var(--border);color:var(--text)}
 .btn:active{transform:scale(.98)}
@@ -11076,39 +11079,39 @@ video{width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}
 .oval.ok{border-color:rgba(47,179,68,.85)}
 .dot{position:absolute;left:50%;top:6%;width:14px;height:14px;margin-left:-7px;border-radius:50%;
   background:var(--accent);box-shadow:0 0 0 6px rgba(77,171,247,.25)}
-.status{position:absolute;left:12px;right:12px;bottom:14px;text-align:center;font-size:15px;
+.status{position:absolute;left:12px;right:12px;bottom:14px;text-align:center;font-size:18px;
   font-weight:600;text-shadow:0 1px 4px #000}
 .bar{height:6px;border-radius:3px;background:var(--border);overflow:hidden}
 .bar>div{height:100%;width:0;background:var(--accent)}
 .overlay{position:fixed;inset:0;display:none;z-index:50;align-items:center;justify-content:center;
   flex-direction:column;gap:16px;padding:24px;text-align:center;user-select:none;-webkit-user-select:none}
-#flash{background:#000;color:#777;font-size:15px}
+#flash{background:#000;color:#777;font-size:18px}
 #flash .fdot{width:16px;height:16px;border-radius:50%;background:#555}
 #pvt{background:var(--bg);touch-action:none}
 #pvtdot{width:160px;height:160px;border-radius:50%;background:#222;display:flex;align-items:center;
   justify-content:center;font-size:30px;font-weight:800;color:#fff}
-#pvtmsg{font-size:16px;color:var(--muted);max-width:280px;line-height:1.45}
-#pvtleft{font-size:13px;color:var(--muted)}
-.verdict{font-size:24px;font-weight:800}
+#pvtmsg{font-size:19px;color:var(--muted);max-width:280px;line-height:1.45}
+#pvtleft{font-size:15px;color:var(--muted)}
+.verdict{font-size:30px;font-weight:800}
 .row{display:flex;justify-content:space-between;align-items:baseline;gap:10px;padding:10px 0;
-  border-bottom:1px solid var(--border);font-size:15px}
+  border-bottom:1px solid var(--border);font-size:17px}
 .row:last-child{border-bottom:none}
 .row .v{font-weight:700;text-align:right}
-.row .u{display:block;font-size:12.5px;color:var(--muted);font-weight:500}
+.row .u{display:block;font-size:14.5px;color:var(--muted);font-weight:500}
 .worse{color:var(--watch)} .better{color:var(--good)}
-.note{font-size:12.5px;color:var(--muted);line-height:1.5}
+.note{font-size:14.5px;color:var(--muted);line-height:1.5}
 .refs{margin-top:8px;padding-top:14px;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:8px}
-.refs h3{font-size:13px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+.refs h3{font-size:15px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
 .refs ol{padding-left:18px;display:flex;flex-direction:column;gap:6px}
-.refs li{font-size:12px;line-height:1.45;color:var(--muted)}
+.refs li{font-size:14px;line-height:1.45;color:var(--muted)}
 .refs li i{color:var(--text);font-style:italic}
-.refs .disc{font-size:12px;line-height:1.45;color:var(--muted)}
+.refs .disc{font-size:14px;line-height:1.45;color:var(--muted)}
 .hide{display:none!important}
 .cq{display:flex;flex-direction:column;gap:6px}
-.cq .lab{font-size:14.5px;color:var(--text);font-weight:600}
+.cq .lab{font-size:17px;color:var(--text);font-weight:600}
 .seg{display:flex;gap:6px}
 .seg button{flex:1;min-height:42px;border-radius:12px;border:1px solid var(--border);background:transparent;
-  color:var(--text);font-size:15px;font-weight:600;cursor:pointer}
+  color:var(--text);font-size:17px;font-weight:600;cursor:pointer}
 .seg button.on{background:var(--accent);border-color:var(--accent);color:#07121f}
 </style></head>
 <body><div class="wrap">
@@ -11116,7 +11119,7 @@ video{width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}
 <div class="top"><a href="/" id="backlink">‹ ADPTVV</a><span class="step" id="step"></span></div>
 
 <section id="intro" class="wrap" style="gap:14px">
-  <h1>Eye Check</h1>
+  <h1>NeuroCheck</h1>
   <p>__FIRST__, this takes about 4 minutes. Your eyes and reactions are compared with your own normal,
      so do it at a similar time each day — ideally before training, before caffeine.</p>
   <div class="card">
@@ -11154,7 +11157,7 @@ video{width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}
 </section>
 
 <section id="result" class="wrap hide" style="gap:14px">
-  <div class="step">Eye Check result</div>
+  <div class="step">NeuroCheck result</div>
   <div class="verdict" id="verdict"></div>
   <p id="vsub"></p>
   <div class="card" id="vactionCard" style="gap:4px">
@@ -11950,7 +11953,7 @@ def chat_view_layout():
         html.Div([
             html.I(className="bi bi-database-check"),
             html.Span("AdaptivIQ looks at: your last 6 weeks of sessions and notes · check-ins vs your usual · "
-                      "training load · PBs, track reps and lifts · Eye Checks · your next 7 days of training"),
+                      "training load · PBs, track reps and lifts · NeuroChecks · your next 7 days of training"),
         ], className="chat-context"),
         html.Div(id="chat-chips", className="chat-chips", children=[
             html.Button(q, id={"type": "chat-chip", "i": k}, n_clicks=0, className="chat-chip")
@@ -12096,7 +12099,7 @@ def build_chat_context(athlete: str) -> str:
         if athlete in _eye_athletes():
             er = load_eye_rows(athlete)
             if not er.empty:
-                lines.append("\nEYE CHECKS (latest 5):")
+                lines.append("\nNEUROCHECKS (latest 5):")
                 for _, r in er.tail(5).iterrows():
                     lines.append(f"- {r.get('Date', '')}: blink rate {r.get('Blink_Rate', '')}/min, "
                                  f"reaction {r.get('PVT3_Median_ms', '')} ms, lapses {r.get('PVT3_Lapses', '')}")
